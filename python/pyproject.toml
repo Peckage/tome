@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "xml2json"
+version = "1.0.0"
+description = "Stream large XML files to JSON with roughly constant memory use, from the command line or a GTK window."
+requires-python = ">=3.10"
+readme = "README.md"
+# The GUI needs PyGObject with GTK 3. Use the system package (python3-gi,
+# gir1.2-gtk-3.0) rather than installing PyGObject from PyPI.
+
+[project.scripts]
+xml2json = "xml2json.cli:main"
+
+[project.gui-scripts]
+xml2json-gui = "xml2json.gui:main"
+
+[tool.setuptools]
+packages = ["xml2json"]
