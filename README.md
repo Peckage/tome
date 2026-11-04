@@ -45,6 +45,27 @@ A 132 MB minified JSON file that is a single line scrolls just as smoothly, beca
 - **Go to line** with Ctrl+G.
 - The toolbar shows the encoding guess (UTF-8, UTF-16, 8-bit or binary) and the line endings (LF or CRLF).
 
+### Editing
+
+UTF-8 files are editable at any size. Other encodings and binary files open read-only.
+
+| 448 MB log, 5 million lines | Time |
+|---|---|
+| Change, delete and insert lines | microseconds |
+| Save and reopen | 0.31 s |
+
+- **Edit a line** by double-clicking it, pressing Enter or F2, or just typing on a selected line.
+  - Enter splits the line at the cursor. Backspace at the start joins it with the line above, and Delete at the end joins the next line.
+  - ↑/↓ move to the neighbouring line, and Esc drops the change to the current line.
+- **Lines:** Delete removes the selected lines and Ctrl+X cuts them. Ctrl+V pastes below the selection, Ctrl+D duplicates and Ctrl+Enter inserts an empty line. The right-click menu has the same actions.
+- **Undo** with Ctrl+Z, **redo** with Ctrl+Y or Ctrl+Shift+Z. Edited lines are marked in the margin.
+- **Find & replace** opens with Ctrl+H. *Replace* changes the current match and *Replace all* every match. With `.*` on, `$1` in the replacement inserts the first group.
+- **Save** with Ctrl+S and **Save as** with Ctrl+Shift+S. Opening another file, dropping one on the window, or closing the window with unsaved changes asks first.
+
+How it works: the edits are a piece table over lines of the memory-mapped file. Unchanged lines are never copied, so one edit in a 500 MB file costs three small pieces, and undo snapshots are cheap. Saving streams the pieces to a temporary file next to the original. Unchanged runs are copied byte for byte with their own line endings, new lines get the file's line ending (LF or CRLF), and a missing final newline stays missing. The temporary file is then renamed over the original, which is never written in place. Search keeps working while you edit: the mapped file is still searched on all cores, and the hits move to where their lines are now.
+
+The Records and preview views, and the format exports, read the file on disk. Save your edits first, and the export button stays disabled until you do.
+
 XML files also get the **Records** view below. Switch between the two with the tabs above the list.
 
 ## Records view (XML and JSON)
@@ -137,7 +158,7 @@ For pretty output most of the remaining time is writing the roughly 1 GB file. T
 ```sh
 cargo build --release
 python3 tests/compare_with_python.py --random 1000   # Rust vs the Python reference, byte for byte
-cargo test --release                                 # window logic, run headless
+cargo test --release                                 # editor model, window logic, run headless
 TOME_BIG=big.xml cargo test --release -- --ignored --nocapture   # timings on a big file
 ```
 

@@ -1,4 +1,5 @@
 mod cli;
+mod edit;
 mod engine;
 mod gui;
 mod json;

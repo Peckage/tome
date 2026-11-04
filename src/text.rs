@@ -128,18 +128,6 @@ impl TextFile {
     pub fn line_start(&self, i: usize) -> u64 {
         self.starts[i]
     }
-
-    /// Lines `first..=last` joined with `\n`, at most `limit` bytes.
-    /// Returns the text and whether it was cut short.
-    pub fn copy_lines(&self, first: usize, last: usize, limit: usize) -> (String, bool) {
-        let start = self.starts[first] as usize;
-        let end = self.line_range(last).1;
-        let cut = end - start > limit;
-        let end = if cut { start + limit } else { end };
-        let text = String::from_utf8_lossy(&self.bytes()[start..end]);
-        let text = if self.crlf { text.replace("\r\n", "\n") } else { text.into_owned() };
-        (text, cut)
-    }
 }
 
 fn guess_encoding(b: &[u8]) -> &'static str {
@@ -215,6 +203,53 @@ impl Pattern {
                 }
             }
         }
+    }
+}
+
+impl Pattern {
+    /// `hay` with every match replaced. With `expand` (regex mode), `$1`
+    /// and `${name}` in `with` refer to groups; otherwise `with` is literal.
+    pub fn replace_all(&self, hay: &[u8], with: &str, expand: bool) -> Vec<u8> {
+        self.replace_where(hay, with, expand, None)
+    }
+
+    /// `hay` with only the match starting at byte `at` replaced.
+    pub fn replace_at(&self, hay: &[u8], at: usize, with: &str, expand: bool) -> Vec<u8> {
+        self.replace_where(hay, with, expand, Some(at))
+    }
+
+    fn replace_where(&self, hay: &[u8], with: &str, expand: bool, only: Option<usize>) -> Vec<u8> {
+        let mut out = Vec::with_capacity(hay.len());
+        let mut last = 0;
+        match self {
+            Pattern::Literal(_) => {
+                self.for_each(hay, |s, e| {
+                    if only.is_none_or(|at| at == s) {
+                        out.extend_from_slice(&hay[last..s]);
+                        out.extend_from_slice(with.as_bytes());
+                        last = e;
+                    }
+                    true
+                });
+            }
+            Pattern::Regex(re) => {
+                for caps in re.captures_iter(hay) {
+                    let m = caps.get(0).unwrap();
+                    if m.start() == m.end() || only.is_some_and(|at| at != m.start()) {
+                        continue;
+                    }
+                    out.extend_from_slice(&hay[last..m.start()]);
+                    if expand {
+                        caps.expand(with.as_bytes(), &mut out);
+                    } else {
+                        out.extend_from_slice(with.as_bytes());
+                    }
+                    last = m.end();
+                }
+            }
+        }
+        out.extend_from_slice(&hay[last..]);
+        out
     }
 }
 
@@ -320,7 +355,6 @@ mod tests {
         assert_eq!(t.line(2), b"");
         assert_eq!(t.line(3), b"last");
         assert_eq!(t.line_of(5), 1);
-        assert_eq!(t.copy_lines(0, 1, 100), ("one\ntwo".into(), false));
 
         let t = file("b.txt", b"a\nb\n");
         assert_eq!(t.line_count(), 2);

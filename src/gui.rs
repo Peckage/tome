@@ -23,7 +23,7 @@ use crate::text::TextFile;
 mod preview;
 mod textview;
 use preview::PreviewView;
-use textview::TextView;
+use textview::{SaveRequest, TextView};
 
 pub const APP_ID: &str = "io.github.peckage.Tome";
 const ROW_HEIGHT: f32 = 20.0;
@@ -386,12 +386,36 @@ pub struct App {
     convert_job: Option<Job<Converted>>,
     dialog: Option<Receiver<DialogResult>>,
 
+    /// Saving text edits, and what to do once that is done.
+    save_job: Option<Job<Saved>>,
+    after_save: Option<Pending>,
+    /// Waiting for Save / Discard / Cancel.
+    pending: Option<Pending>,
+    allow_close: bool,
+    title: String,
+    /// The file was just reopened after saving: keep the "Saved" message.
+    quiet_open: bool,
+
     status: Status,
 }
 
 enum DialogResult {
     Open(Option<PathBuf>),
     Save(Option<PathBuf>),
+    SaveText(Option<PathBuf>),
+}
+
+/// Something that has to wait for an answer about unsaved edits.
+#[derive(Clone, Debug, PartialEq)]
+enum Pending {
+    Open(PathBuf),
+    Close,
+}
+
+struct Saved {
+    target: PathBuf,
+    temporary: std::io::Result<PathBuf>,
+    seconds: f64,
 }
 
 impl Default for App {
@@ -436,6 +460,12 @@ impl Default for App {
             confirm_overwrite: false,
             convert_job: None,
             dialog: None,
+            save_job: None,
+            after_save: None,
+            pending: None,
+            allow_close: false,
+            title: String::new(),
+            quiet_open: false,
             status: Status { text: "Open a file (Ctrl+O), or drop one on this window.".into(), error: false },
         }
     }
@@ -801,7 +831,7 @@ impl App {
                 match done.text {
                     Ok(text) => {
                         self.lines = Some(text.line_count() as u64);
-                        if self.kind.is_none() {
+                        if self.kind.is_none() && !std::mem::take(&mut self.quiet_open) {
                             self.set_status(
                                 format!("Opened {} lines in {:.2} s.", group(text.line_count() as u64), done.seconds),
                                 false,
@@ -828,7 +858,9 @@ impl App {
                                 self.auto_tag = tag;
                             }
                         }
-                        self.set_status(format!("Opened in {:.2} s{note}.", done.seconds), false);
+                        if !std::mem::take(&mut self.quiet_open) {
+                            self.set_status(format!("Opened in {:.2} s{note}.", done.seconds), false);
+                        }
                         self.start_index(ctx);
                     }
                     Err(e) => {
@@ -929,8 +961,10 @@ impl App {
             if let Ok(result) = rx.try_recv() {
                 self.dialog = None;
                 match result {
-                    DialogResult::Open(Some(path)) => self.open(path, ctx),
+                    DialogResult::Open(Some(path)) => self.request_open(path, ctx),
                     DialogResult::Save(Some(path)) => self.output = path.display().to_string(),
+                    DialogResult::SaveText(Some(path)) => self.save_text(path, ctx),
+                    DialogResult::SaveText(None) => self.after_save = None,
                     _ => {}
                 }
             }
@@ -951,7 +985,8 @@ impl App {
         if let Some((text, error)) = self.textview.status.take() {
             self.set_status(text, error);
         }
-        let busy = self.open_job.is_some()
+        let busy = self.save_job.is_some()
+            || self.open_job.is_some()
             || self.text_job.is_some()
             || self.index_job.is_some()
             || self.search_job.is_some()
@@ -960,6 +995,153 @@ impl App {
         if busy {
             ctx.request_repaint_after(Duration::from_millis(50));
         }
+    }
+
+    /// Open `path`, asking first when there are unsaved edits.
+    fn request_open(&mut self, path: PathBuf, ctx: &egui::Context) {
+        self.textview.commit();
+        if self.textview.dirty() {
+            self.pending = Some(Pending::Open(path));
+        } else {
+            self.open(path, ctx);
+        }
+    }
+
+    fn handle_save_request(&mut self, request: SaveRequest, ctx: &egui::Context) {
+        let Some(path) = self.path.clone() else { return };
+        match request {
+            SaveRequest::Save => self.save_text(path, ctx),
+            SaveRequest::SaveAs => {
+                let (tx, rx) = channel();
+                let ctx2 = ctx.clone();
+                std::thread::spawn(move || {
+                    let mut dialog = rfd::FileDialog::new().set_title("Save as");
+                    if let Some(dir) = path.parent() {
+                        dialog = dialog.set_directory(dir);
+                    }
+                    if let Some(name) = path.file_name() {
+                        dialog = dialog.set_file_name(name.to_string_lossy());
+                    }
+                    let _ = tx.send(DialogResult::SaveText(dialog.save_file()));
+                    ctx2.request_repaint();
+                });
+                self.dialog = Some(rx);
+            }
+        }
+    }
+
+    /// Write the edited text to `target` (in the background).
+    fn save_text(&mut self, target: PathBuf, ctx: &egui::Context) {
+        let Some(text) = self.text.clone() else { return };
+        if self.save_job.is_some() {
+            return;
+        }
+        self.textview.commit();
+        if !self.textview.dirty() && Some(&target) == self.path.as_ref() {
+            self.set_status("No changes to save.", false);
+            self.run_after_save(ctx);
+            return;
+        }
+        let edits = self.textview.edits.clone();
+        self.set_status(format!("Saving {}…", target.display()), false);
+        self.save_job = Some(Job::spawn(ctx, move |_| {
+            let started = Instant::now();
+            let temporary = crate::edit::write_temporary(&edits, &text, &target);
+            Saved { target, temporary, seconds: started.elapsed().as_secs_f64() }
+        }));
+    }
+
+    fn poll_save(&mut self, ctx: &egui::Context) {
+        let Some(done) = self.save_job.as_ref().and_then(Job::poll) else { return };
+        self.save_job = None;
+        let temporary = match done.temporary {
+            Ok(t) => t,
+            Err(e) => {
+                self.after_save = None;
+                self.set_status(format!("Could not save: {e}. The file was not changed."), true);
+                return;
+            }
+        };
+        let source = self.path.clone().unwrap_or_else(|| done.target.clone());
+        // Let go of every mapping of the old file before replacing it
+        // (required on Windows, harmless elsewhere); it is reopened below.
+        let keep = (self.textview.top, self.textview.left, self.textview.selection, self.view, self.view_chosen);
+        let (search, regex) = (self.textview.search.clone(), self.textview.regex);
+        self.text = None;
+        self.doc = None;
+        self.encoder = None;
+        self.encoder_key = None;
+        for job in [self.search_job.as_ref().map(|j| j.progress.clone()), self.columns_job.as_ref().map(|j| j.progress.clone())].into_iter().flatten() {
+            job.cancel.store(true, Ordering::Relaxed);
+        }
+        self.textview.reset();
+        match crate::edit::finish_save(&temporary, &source, &done.target) {
+            Ok(()) => {
+                self.open(done.target.clone(), ctx);
+                self.quiet_open = true;
+                (self.textview.top, self.textview.left, self.textview.selection, self.view, self.view_chosen) = keep;
+                (self.textview.search, self.textview.regex) = (search, regex);
+                let size = std::fs::metadata(&done.target).map(|m| human_size(m.len())).unwrap_or_default();
+                self.set_status(format!("Saved {} ({size}) in {:.2} s.", done.target.display(), done.seconds), false);
+                self.run_after_save(ctx);
+            }
+            Err(e) => {
+                self.after_save = None;
+                if let Some(path) = self.path.clone() {
+                    self.open(path, ctx);
+                }
+                self.set_status(
+                    format!("Could not replace {}: {e}. Your edits are in {}.", done.target.display(), temporary.display()),
+                    true,
+                );
+            }
+        }
+    }
+
+    fn run_after_save(&mut self, ctx: &egui::Context) {
+        match self.after_save.take() {
+            Some(Pending::Open(path)) => self.open(path, ctx),
+            Some(Pending::Close) => {
+                self.allow_close = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            None => {}
+        }
+    }
+
+    /// Save / Discard / Cancel when unsaved edits are in the way.
+    fn unsaved_bar(&mut self, ui: &mut egui::Ui) {
+        let Some(pending) = self.pending.clone() else { return };
+        let ctx = ui.ctx().clone();
+        let name = self.path.as_ref().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        ui.horizontal(|ui| {
+            let what = match &pending {
+                Pending::Close => "before closing",
+                Pending::Open(_) => "before opening another file",
+            };
+            ui.label(RichText::new(format!("{name} has unsaved changes. Save them {what}?")).strong().color(ui.visuals().warn_fg_color));
+            if ui.button("Save").clicked() {
+                self.pending = None;
+                self.after_save = Some(pending.clone());
+                if let Some(path) = self.path.clone() {
+                    self.save_text(path, &ctx);
+                }
+            }
+            if ui.button("Discard changes").clicked() {
+                self.pending = None;
+                match &pending {
+                    Pending::Open(path) => self.open(path.clone(), &ctx),
+                    Pending::Close => {
+                        self.allow_close = true;
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                }
+            }
+            if ui.button("Cancel").clicked() {
+                self.pending = None;
+            }
+        });
+        ui.separator();
     }
 
     fn open_dialog(&mut self, ctx: &egui::Context) {
@@ -1008,15 +1190,37 @@ impl App {
 
         let dropped = ui.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).find(|p| !p.as_os_str().is_empty()));
         if let Some(path) = dropped {
-            self.open(path, &ctx);
+            self.request_open(path, &ctx);
+        }
+        self.poll_save(&ctx);
+        if let Some(request) = self.textview.save_request.take() {
+            self.handle_save_request(request, &ctx);
+        }
+        // Closing the window with unsaved edits asks first.
+        if ui.input(|i| i.viewport().close_requested()) && self.textview.dirty() && !self.allow_close {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.pending = Some(Pending::Close);
+        }
+        let title = match &self.path {
+            Some(p) => {
+                let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                format!("{}{name} — Tome", if self.textview.dirty() { "● " } else { "" })
+            }
+            None => "Tome".to_string(),
+        };
+        if title != self.title {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
+            self.title = title;
         }
 
         if ui.input(|i| i.modifiers.command && i.key_pressed(Key::O)) && self.dialog.is_none() {
+            self.textview.commit();
             self.open_dialog(&ctx);
         }
 
         egui::Panel::top("file").show(ui, |ui| {
             ui.add_space(6.0);
+            self.unsaved_bar(ui);
             self.file_bar(ui);
             if self.kind.is_some() {
                 ui.add_space(2.0);
@@ -1037,7 +1241,8 @@ impl App {
         egui::CentralPanel::default().show(ui, |ui| {
             if self.path.is_some() {
                 ui.horizontal(|ui| {
-                    if ui.selectable_label(self.view == View::Text, "Text").on_hover_text("Every line of the file").clicked() {
+                    let text_label = if self.textview.dirty() { "Text ●" } else { "Text" };
+                    if ui.selectable_label(self.view == View::Text, text_label).on_hover_text("Every line of the file. Double-click a line to edit it.").clicked() {
                         self.view = View::Text;
                         self.view_chosen = true;
                     }
@@ -1047,6 +1252,7 @@ impl App {
                             .on_hover_text("One row per record, with the JSON it converts to")
                             .clicked()
                     {
+                        self.textview.commit();
                         self.view = View::Records;
                         self.view_chosen = true;
                     }
@@ -1056,6 +1262,7 @@ impl App {
                             .on_hover_text("The whole file in the selected format, exactly as Save writes it. Change the format above to see it another way.")
                             .clicked()
                     {
+                        self.textview.commit();
                         self.view = View::Preview;
                         self.view_chosen = true;
                         if let (Some(record), Some(doc), Some(ranges), Some(encoder)) = (self.selected, &self.doc, &self.ranges, &self.encoder) {
@@ -1082,9 +1289,13 @@ impl App {
         if let Some((text, error)) = self.textview.status.take().or_else(|| self.preview.status.take()) {
             self.set_status(text, error);
         }
+        if let Some(request) = self.textview.save_request.take() {
+            self.handle_save_request(request, &ctx);
+        }
     }
 
     fn preview_panel(&mut self, ui: &mut egui::Ui) {
+        self.unsaved_note(ui);
         let (Some(doc), Some(ranges)) = (self.doc.clone(), self.ranges.clone()) else {
             ui.centered_and_justified(|ui| ui.label(RichText::new("Reading…").weak().size(16.0)));
             return;
@@ -1192,7 +1403,7 @@ impl App {
             }
             ui.separator();
             ui.label("Output");
-            ui.add_enabled(!converting, egui::TextEdit::singleline(&mut self.output).desired_width(ui.available_width() - 260.0));
+            ui.add_enabled(!converting, egui::TextEdit::singleline(&mut self.output).desired_width(ui.available_width() - 320.0));
             if ui.add_enabled(!converting && self.dialog.is_none() && has_doc, egui::Button::new("…")).on_hover_text("Choose output file").clicked() {
                 self.save_dialog(&ctx);
             }
@@ -1203,8 +1414,9 @@ impl App {
                     }
                 }
             } else if ui
-                .add_enabled(has_doc, egui::Button::new(RichText::new("💾 Save").strong()))
+                .add_enabled(has_doc && !self.textview.dirty(), egui::Button::new(RichText::new(format!("💾 Save as {}", self.format.name())).strong()))
                 .on_hover_text("Write the whole file in the selected format (what the preview shows)")
+                .on_disabled_hover_text("Save your text edits first (Ctrl+S): exports read the file on disk")
                 .clicked()
             {
                 self.start_convert(&ctx, false);
@@ -1335,7 +1547,14 @@ impl App {
         }
     }
 
+    fn unsaved_note(&self, ui: &mut egui::Ui) {
+        if self.textview.dirty() {
+            ui.label(RichText::new("● This view shows the file on disk. Your text edits appear here after you save them (Ctrl+S).").color(ui.visuals().warn_fg_color));
+        }
+    }
+
     fn records_panel(&mut self, ui: &mut egui::Ui) {
+        self.unsaved_note(ui);
         self.search_bar(ui);
         ui.add_space(4.0);
 
@@ -1569,6 +1788,16 @@ mod tests {
     use super::*;
 
     fn frame(ctx: &egui::Context, app: &mut App, events: Vec<egui::Event>) {
+        // Like a real window: the modifier state follows the key events.
+        let modifiers = events
+            .iter()
+            .find_map(|e| match e {
+                egui::Event::Key { modifiers, .. } => Some(*modifiers),
+                _ => None,
+            })
+            .unwrap_or_default();
+        let mut events = events;
+        events.insert(0, egui::Event::ModifiersChanged(modifiers));
         let input = egui::RawInput {
             screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(1200.0, 800.0))),
             events,
@@ -1845,6 +2074,111 @@ mod tests {
         assert!(app.status.text.starts_with("Wrote 20,000 records"), "{}", app.status.text);
         assert!(std::fs::read_to_string(dir.join("out.yaml")).unwrap().starts_with("- id: \"00000\""));
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn key(key: Key, modifiers: egui::Modifiers) -> egui::Event {
+        egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers }
+    }
+
+    /// Drive the editor with real key events, then save and check the file.
+    #[test]
+    fn edit_and_save_text() {
+        let dir = temp_dir("edit");
+        let path = dir.join("notes.txt");
+        std::fs::write(&path, "alpha\r\nbeta\r\ngamma").unwrap();
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.open(path.clone(), &ctx);
+        wait(&ctx, &mut app, |a| a.text_job.is_none());
+        frame(&ctx, &mut app, vec![]);
+        let none = egui::Modifiers::NONE;
+        let ctrl = egui::Modifiers::COMMAND;
+
+        // Select line 2, press Enter to edit, type at the end, Enter splits.
+        app.textview.selection = Some((1, 1));
+        frame(&ctx, &mut app, vec![key(Key::Enter, none)]);
+        frame(&ctx, &mut app, vec![]);
+        frame(&ctx, &mut app, vec![egui::Event::Text("!".into())]);
+        frame(&ctx, &mut app, vec![key(Key::Enter, none)]);
+        frame(&ctx, &mut app, vec![]);
+        frame(&ctx, &mut app, vec![egui::Event::Text("new line".into())]);
+        frame(&ctx, &mut app, vec![key(Key::Escape, none)]); // cancels only the last, uncommitted typing
+        assert!(app.textview.dirty());
+        assert!(app.title.starts_with("● notes.txt"), "{}", app.title);
+
+        // Exports are blocked while there are unsaved edits; closing asks.
+        let text = app.text.clone().unwrap();
+        let lines: Vec<String> = (0..app.textview.edits.line_count()).map(|i| String::from_utf8_lossy(&app.textview.edits.line(&text, i)).into_owned()).collect();
+        assert_eq!(lines, ["alpha", "beta!", "", "gamma"]);
+
+        // Delete the empty line, undo, redo.
+        app.textview.selection = Some((2, 2));
+        frame(&ctx, &mut app, vec![key(Key::Delete, none)]);
+        assert_eq!(app.textview.edits.line_count(), 3);
+        frame(&ctx, &mut app, vec![key(Key::Z, ctrl)]);
+        assert_eq!(app.textview.edits.line_count(), 4);
+        frame(&ctx, &mut app, vec![key(Key::Y, ctrl)]);
+        assert_eq!(app.textview.edits.line_count(), 3);
+
+        // Opening another file while dirty asks first.
+        app.request_open(dir.join("other.txt"), &ctx);
+        assert_eq!(app.pending, Some(Pending::Open(dir.join("other.txt"))));
+        app.pending = None;
+
+        // Ctrl+S writes it, keeping CRLF and the missing final newline.
+        frame(&ctx, &mut app, vec![key(Key::S, ctrl)]);
+        wait(&ctx, &mut app, |a| a.save_job.is_none() && a.text_job.is_none());
+        frame(&ctx, &mut app, vec![]);
+        assert!(app.status.text.starts_with("Saved"), "{}", app.status.text);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "alpha\r\nbeta!\r\ngamma");
+        assert!(!app.textview.dirty());
+        assert_eq!(app.title, "notes.txt — Tome");
+
+        // Find and replace all, with a regex group.
+        app.textview.search = "(a)(\\w)".into();
+        app.textview.regex = true;
+        let text = app.text.clone().unwrap();
+        app.textview.start_search(&ctx, &text);
+        wait(&ctx, &mut app, |a| !a.textview.busy());
+        frame(&ctx, &mut app, vec![]);
+        app.textview.replace = "$2$1".into();
+        app.textview.show_replace = true;
+        let n = app.textview.matches.as_ref().unwrap().len();
+        assert_eq!(n, 2, "al in alpha, am in gamma");
+        let mut tv = std::mem::take(&mut app.textview);
+        tv.replace_all_for_test(&ctx, &text);
+        app.textview = tv;
+        frame(&ctx, &mut app, vec![key(Key::S, ctrl)]);
+        wait(&ctx, &mut app, |a| a.save_job.is_none() && a.text_job.is_none());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "lapha\r\nbeta!\r\ngmama");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Run with: TOME_BIG_TEXT=/path/copy.log cargo test --release big_edit -- --ignored --nocapture
+    /// (edits and saves the file!)
+    #[test]
+    #[ignore]
+    fn big_edit_save() {
+        let Ok(path) = std::env::var("TOME_BIG_TEXT") else { return };
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.open(PathBuf::from(&path), &ctx);
+        wait(&ctx, &mut app, |a| a.text_job.is_none());
+        frame(&ctx, &mut app, vec![]);
+        let total = app.textview.edits.line_count();
+        let t = Instant::now();
+        app.textview.edits.set_line(total / 2, "EDITED IN THE MIDDLE".into());
+        app.textview.edits.splice(10, 20, vec![]);
+        app.textview.edits.splice(0, 0, vec!["first".into()]);
+        println!("three edits: {:.3} ms", t.elapsed().as_secs_f64() * 1000.0);
+        let t = Instant::now();
+        for _ in 0..20 { frame(&ctx, &mut app, vec![]); }
+        println!("draw frame with edits: {:.2} ms", t.elapsed().as_secs_f64() * 1000.0 / 20.0);
+        let t = Instant::now();
+        app.save_text(PathBuf::from(&path), &ctx);
+        wait(&ctx, &mut app, |a| a.save_job.is_none() && a.text_job.is_none());
+        println!("save + reopen: {:.3}s  {}", t.elapsed().as_secs_f64(), app.status.text);
+        assert_eq!(app.lines, Some(total as u64 - 9));
     }
 
     /// Run with: TOME_BIG=/path/big.xml cargo test --release preview_timings -- --ignored --nocapture
