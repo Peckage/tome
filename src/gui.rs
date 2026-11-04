@@ -37,6 +37,7 @@ pub fn run(path: Option<PathBuf>) -> i32 {
         viewport: egui::ViewportBuilder::default()
             .with_app_id(APP_ID)
             .with_title("Tome")
+            .with_icon(eframe::icon_data::from_png_bytes(include_bytes!("../data/tome.png")).expect("bundled icon"))
             .with_inner_size([1280.0, 820.0])
             .with_min_inner_size([720.0, 420.0])
             .with_drag_and_drop(true),
@@ -61,6 +62,13 @@ pub fn run(path: Option<PathBuf>) -> i32 {
         Ok(()) => 0,
         Err(e) => {
             eprintln!("error: could not open a window: {e}");
+            // tome.exe has no console to print to: say it in a message box.
+            #[cfg(windows)]
+            rfd::MessageDialog::new()
+                .set_level(rfd::MessageLevel::Error)
+                .set_title("Tome")
+                .set_description(format!("Could not open a window: {e}\n\nTome needs OpenGL 2 or newer. Updating the graphics driver usually helps."))
+                .show();
             1
         }
     }

@@ -1,49 +1,84 @@
 #!/bin/sh
-# Build Tome and add it to the application menu for the current user.
+# Install Tome for the current user, with an entry in the application menu.
 #
-#   ./install.sh            build, copy the binary to ./bin, write the menu entry
-#   ./install.sh --remove   remove the menu entry again
+#   ./install.sh            install (no root needed)
+#   ./install.sh --remove   uninstall
 #
-# Outside the repository this writes the menu entry below and refreshes the
-# MIME cache next to it (update-desktop-database rewrites mimeinfo.cache):
+# Works from a release download (uses the `tome` next to this script) and
+# from a source checkout (builds it with cargo first). It writes:
+#   ~/.local/bin/tome
 #   ~/.local/share/applications/io.github.peckage.Tome.desktop
-# It also removes the entry of the old name, io.github.xml2json.Converter.
+#   ~/.local/share/icons/hicolor/scalable/apps/io.github.peckage.Tome.svg
+# and refreshes the menu cache. Set PREFIX to use another place
+# than ~/.local (for example PREFIX=/usr/local with sudo).
 set -eu
 
-repo=$(cd "$(dirname "$0")" && pwd)
-apps="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
+here=$(cd "$(dirname "$0")" && pwd)
+prefix="${PREFIX:-$HOME/.local}"
+if [ -n "${PREFIX:-}" ]; then
+    share="$prefix/share"
+else
+    share="${XDG_DATA_HOME:-$HOME/.local/share}"
+fi
+bin="$prefix/bin/tome"
+apps="$share/applications"
 entry="$apps/io.github.peckage.Tome.desktop"
-old_entry="$apps/io.github.xml2json.Converter.desktop"
+icon="$share/icons/hicolor/scalable/apps/io.github.peckage.Tome.svg"
+
+refresh() {
+    command -v update-desktop-database >/dev/null && update-desktop-database "$apps" 2>/dev/null || true
+    # Only refresh an icon cache that exists: creating one would hide icons
+    # that other programs add there later without refreshing it.
+    if [ -f "$share/icons/hicolor/icon-theme.cache" ] && command -v gtk-update-icon-cache >/dev/null; then
+        gtk-update-icon-cache -q -t "$share/icons/hicolor" 2>/dev/null || true
+    fi
+}
 
 if [ "${1:-}" = "--remove" ]; then
-    rm -f "$entry" "$old_entry"
-    command -v update-desktop-database >/dev/null && update-desktop-database "$apps" || true
-    echo "removed $entry"
+    rm -f "$bin" "$entry" "$icon" "$apps/io.github.xml2json.Converter.desktop"
+    refresh
+    echo "Removed Tome."
     exit 0
 fi
 
-cargo build --release --manifest-path "$repo/Cargo.toml"
-mkdir -p "$repo/bin" "$apps"
-# Copy rather than link, so `cargo clean` does not break the menu entry.
-cp "$repo/target/release/tome" "$repo/bin/tome.new"
-mv "$repo/bin/tome.new" "$repo/bin/tome"
-rm -f "$repo/bin/xml2json" "$old_entry"
+# The program: next to this script in a release download, else build it.
+if [ -f "$here/tome" ] && [ ! -f "$here/Cargo.toml" ]; then
+    program="$here/tome"
+    svg="$here/tome.svg"
+else
+    cargo build --release --manifest-path "$here/Cargo.toml"
+    program="$here/target/release/tome"
+    svg="$here/data/tome.svg"
+fi
 
-cat > "$entry" <<EOF
+mkdir -p "$(dirname "$bin")" "$apps" "$(dirname "$icon")"
+# Copy to a new name and rename, so a running Tome is not overwritten.
+cp "$program" "$bin.new"
+chmod 755 "$bin.new"
+mv "$bin.new" "$bin"
+cp "$svg" "$icon"
+rm -f "$apps/io.github.xml2json.Converter.desktop"
+
+cat > "$entry" <<DESKTOP
 [Desktop Entry]
 Type=Application
 Name=Tome
 GenericName=Text Viewer
-Comment=Open, search and convert huge text files
-Exec="$repo/bin/tome" %f
-Icon=$repo/data/tome.svg
+Comment=Open, search, edit and convert huge text files
+Exec="$bin" %f
+Icon=io.github.peckage.Tome
 Terminal=false
 Categories=Utility;TextTools;
 MimeType=text/plain;text/x-log;text/csv;application/xml;text/xml;application/json;application/x-ndjson;
 Keywords=text;editor;viewer;log;large;xml;json;csv;convert;
 StartupWMClass=io.github.peckage.Tome
-EOF
+DESKTOP
 
 command -v desktop-file-validate >/dev/null && desktop-file-validate "$entry"
-command -v update-desktop-database >/dev/null && update-desktop-database "$apps" || true
-echo "installed $entry"
+refresh
+echo "Installed $bin"
+echo "Tome is in the application menu, and under \"Open with\" for text, XML and JSON files."
+case ":$PATH:" in
+    *":$prefix/bin:"*) ;;
+    *) echo "Note: $prefix/bin is not on your PATH. Add it to use \`tome\` in a terminal." ;;
+esac

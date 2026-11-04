@@ -38,20 +38,49 @@ Other formats on a 229 MB file with 1.3 million records take 0.25–0.6 s each (
 
 ## Install
 
-**Download** a build for Linux (x86_64), Windows (x86_64) or macOS (Apple silicon) from [Releases](https://github.com/Peckage/tome/releases). It is a single executable. The macOS build is not signed: right-click it and choose Open the first time.
+Download the file for your system from the [latest release](https://github.com/Peckage/tome/releases/latest).
 
-**From source** (current stable Rust):
+### Windows 10 and 11 (x64)
+
+- **Installer:** run `tome-vX.Y.Z-windows-x86_64-setup.exe`. It installs for your user only and needs no administrator rights. You get a Start menu entry, "Open with → Tome" for text, log, CSV, XML, JSON and YAML files (Tome is not made the default app), and optionally `tome-cli` on your PATH. Uninstall it from *Settings → Apps*.
+- **Portable:** unzip `tome-vX.Y.Z-windows-x86_64.zip` anywhere and run `tome.exe`.
+
+The downloads are not code-signed yet, so SmartScreen may say "Windows protected your PC": choose **More info → Run anyway**.
+
+`tome.exe` is the app: it opens no console window. In a terminal (cmd, PowerShell, Windows Terminal) use **`tome-cli.exe`**, which is the same program as a console program, so the shell waits for it, shows its output and gets its exit code. For example `tome-cli parts.xml parts.json`.
+
+### Linux (x64)
+
+- **Ubuntu, Debian, Pop!_OS, Mint:** download `tome_X.Y.Z_amd64.deb` and open it, or run `sudo apt install ./tome_X.Y.Z_amd64.deb`.
+- **Any other distribution:** unpack the tarball and run the installer. It needs no root and puts `tome` in `~/.local/bin` with an entry in the application menu:
+
+  ```sh
+  tar xzf tome-vX.Y.Z-linux-x86_64.tar.gz
+  cd tome-vX.Y.Z-linux-x86_64
+  ./install.sh              # ./install.sh --remove uninstalls
+  ```
+
+Either way Tome appears in the application menu and under "Open with" for text, XML and JSON files (it is not made the default app). It needs glibc 2.35 or newer (Ubuntu 22.04, Debian 12, Fedora 36 and later) and works on Wayland and X11. The open and save dialogs use the desktop portal (`xdg-desktop-portal`), which every common desktop has.
+
+### macOS (Apple silicon)
+
+Unpack `tome-vX.Y.Z-macos-arm64.tar.gz`. The build is not signed: right-click `tome` and choose Open the first time.
+
+### From source
+
+With current stable Rust:
 
 ```sh
 git clone https://github.com/Peckage/tome && cd tome
 cargo build --release              # target/release/tome
-./install.sh                       # Linux: copies the binary to ./bin and adds "Tome" to the app menu
-./install.sh --remove              # removes the menu entry
+./install.sh                       # Linux: builds, then installs like the tarball does
 ```
 
-`.cargo/config.toml` builds for your own CPU (`target-cpu=native`). Remove that line to build a binary for other machines.
+`.cargo/config.toml` builds for your own CPU (`target-cpu=native`), which is fastest but may not run on other machines. The release builds use `x86-64-v2` (any x86-64 CPU from about 2009 on). On Windows, `cargo build --release --features console` builds the console version.
 
-On Linux the menu entry also shows up under "Open with" for text, XML and JSON files (it is not made the default app). Outside the repository the script writes only `~/.local/share/applications/io.github.peckage.Tome.desktop` (and removes the old `io.github.xml2json.Converter.desktop`), and it refreshes `mimeinfo.cache` in that folder.
+### Making a release
+
+Set `version` in `Cargo.toml`, commit, and push a matching tag (`git tag v0.2.0 && git push origin v0.2.0`). The [Release workflow](.github/workflows/release.yml) builds and smoke-tests every download and publishes them with checksums. You can also run that workflow by hand from the Actions tab, which builds the downloads without publishing them.
 
 ## Text view
 
@@ -97,7 +126,7 @@ XML files also get the **Records** view below. Switch between the two with the t
 
 ## Records view (XML and JSON)
 
-`bin/tome` (or `bin/tome any-file`, or drop a file on the window, or Ctrl+O).
+`tome` (or `tome any-file`, or drop a file on the window, or Ctrl+O).
 
 XML and JSON files also get two more views.
 
@@ -216,6 +245,7 @@ For each case that converts, it also checks:
 | `src/engine.rs` | Opening files, the parallel conversion pipeline, the shared encoder |
 | `src/gui.rs`, `src/gui/` | The window: text view, records view, live preview |
 | `python/` | The original Python version, kept as the reference for tests |
+| `packaging/`, `install.sh` | Windows installer (Inno Setup), Linux `.deb` and menu entry, user install script |
 
 ## License
 

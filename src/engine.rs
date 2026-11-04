@@ -629,7 +629,7 @@ pub fn convert(doc: &Doc, selector: &str, output: &Path, format: Format, options
 
     match convert_to(doc, selector, &temporary, format, options, progress) {
         Ok(count) => {
-            std::fs::rename(&temporary, output)?;
+            replace_file(&temporary, output)?;
             Ok(count)
         }
         Err(e) => {
@@ -637,6 +637,25 @@ pub fn convert(doc: &Doc, selector: &str, output: &Path, format: Format, options
             Err(e)
         }
     }
+}
+
+/// Rename `from` over `to`. On Windows a rename fails while another
+/// handle has `to` open or mapped (a search thread that is still winding
+/// down, a virus scanner looking at the new file), so retry for a moment
+/// before giving up. Elsewhere this is a plain rename.
+pub fn replace_file(from: &Path, to: &Path) -> std::io::Result<()> {
+    let mut result = std::fs::rename(from, to);
+    if cfg!(windows) {
+        // ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION, ERROR_LOCK_VIOLATION,
+        // ERROR_USER_MAPPED_FILE
+        let transient = |e: &std::io::Error| matches!(e.raw_os_error(), Some(5 | 32 | 33 | 1224));
+        let started = std::time::Instant::now();
+        while result.as_ref().is_err_and(transient) && started.elapsed() < std::time::Duration::from_secs(3) {
+            std::thread::sleep(std::time::Duration::from_millis(25));
+            result = std::fs::rename(from, to);
+        }
+    }
+    result
 }
 
 fn same_file(a: &Path, b: &Path) -> bool {

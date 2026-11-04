@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Tome
+GenericName=Text Viewer
+Comment=Open, search, edit and convert huge text files
+Exec=tome %f
+Icon=io.github.peckage.Tome
+Terminal=false
+Categories=Utility;TextTools;
+MimeType=text/plain;text/x-log;text/csv;application/xml;text/xml;application/json;application/x-ndjson;
+Keywords=text;editor;viewer;log;large;xml;json;csv;convert;
+StartupWMClass=io.github.peckage.Tome
