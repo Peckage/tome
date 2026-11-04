@@ -2,6 +2,12 @@
 name = "tome"
 version = "0.1.0"
 edition = "2024"
+description = "A text viewer, editor and converter built for huge files"
+license = "MIT"
+repository = "https://github.com/Peckage/tome"
+readme = "README.md"
+keywords = ["text-editor", "large-files", "xml", "json", "converter"]
+categories = ["text-editors", "command-line-utilities", "parsing"]
 
 [dependencies]
 anyhow = "1"
