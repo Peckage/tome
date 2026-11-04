@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Check that the Rust converter matches the Python reference byte for byte.
+"""Check that the Rust converter matches the Python reference byte for byte,
+and that every other format and option agrees with a Python model of it.
 
 Usage:
     cargo build --release
@@ -12,18 +13,36 @@ For every case both implementations convert the same file:
     - when Python fails, Rust must fail too (messages may differ),
     - the parallel scanner must find exactly what the sequential one finds,
       at chunk sizes down to 1 byte (forcing every resync path).
+
+For every case Python accepts, it also checks:
+    - the generic writers (--generic) give the same bytes as the fast path,
+    - JSON and NDJSON input converts back to exactly the same JSON,
+    - YAML output loads (PyYAML, YAML 1.1) as the same records,
+    - XML output converts back to the same JSON,
+    - CSV and TSV output match a Python flattening of the records,
+    - the clean-up options match a Python model of them.
 """
 
 from __future__ import annotations
 
 import argparse
+import csv
+import io
 import json
 import os
 import random
+import re
 import subprocess
 import sys
 import tempfile
 import xml.etree.ElementTree as ET
+
+try:
+    import yaml
+except ImportError:  # the YAML check is skipped without PyYAML
+    yaml = None
+
+csv.field_size_limit(1 << 30)
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "python"))
@@ -145,8 +164,9 @@ def run_python(path: str, out: str, tag: str, ndjson: bool) -> tuple[bool, bytes
         return True, f.read()
 
 
-def run_rust(path: str, out: str, tag: str, flag: str | None) -> tuple[bool, bytes | str]:
-    args = [BINARY, path, out, "--tag", tag, "--quiet"] + ([flag] if flag else [])
+def run_rust(path: str, out: str, tag: str | None, flag: str | list[str] | None) -> tuple[bool, bytes | str]:
+    flags = [flag] if isinstance(flag, str) else (flag or [])
+    args = [BINARY, path, out, "--quiet"] + (["--tag", tag] if tag is not None else []) + flags
     proc = subprocess.run(args, capture_output=True, text=True)
     if proc.returncode != 0:
         return False, proc.stderr.strip()
@@ -179,6 +199,140 @@ def compare(name: str, data: bytes, tag: str, workdir: str) -> list[str]:
     ok, rs_nd = run_rust(path, os.path.join(workdir, "rs.ndjson"), tag, "--ndjson")
     if not ok or py_nd != rs_nd:
         problems.append(f"{name}: ndjson output differs\n  python: {py_nd[:400]!r}\n  rust:   {str(rs_nd)[:400]!r}")
+    problems += other_formats(name, path, tag, py, expected_pretty, py_nd, workdir)
+    return problems
+
+
+def json_array(records: list) -> bytes:
+    """The compact layout: a JSON array with one record per line."""
+    if not records:
+        return b"[\n]\n"
+    body = ",\n".join(json.dumps(r, ensure_ascii=False, separators=(",", ":")) for r in records)
+    return f"[\n{body}\n]\n".encode()
+
+
+REMOVED = object()
+
+
+def model_options(record: dict, trim=False, collapse=False, remove_empty=False, unwrap=False,
+                  text_values=False, prefix="", drop=()) -> object:
+    """Python model of node::Options on an XML-derived record."""
+    def from_xml(d: dict) -> dict:
+        return {(prefix + k if isinstance(v, str) and k != "#text" else k):
+                (v if isinstance(v, str) else [from_xml(x) for x in v]) for k, v in d.items()}
+
+    def clean(n):
+        if isinstance(n, str):
+            if collapse:
+                n = re.sub(r"\s+", " ", n)
+            if trim:
+                n = n.strip()
+            return REMOVED if remove_empty and n == "" else n
+        if isinstance(n, list):
+            items = [c for c in map(clean, n) if c is not REMOVED]
+            if remove_empty and not items:
+                return REMOVED
+            return items[0] if unwrap and len(items) == 1 else items
+        out = {}
+        for k, v in n.items():
+            if k in drop:
+                continue
+            c = clean(v)
+            if c is not REMOVED:
+                out[k] = c
+        if remove_empty and not out:
+            return REMOVED
+        if text_values and list(out) == ["#text"] and isinstance(out["#text"], str):
+            return out["#text"]
+        return out
+
+    result = clean(from_xml(record))
+    return {} if result is REMOVED else result
+
+
+OPTION_SETS = [
+    (["--trim", "--remove-empty"], dict(trim=True, remove_empty=True)),
+    (["--collapse-spaces", "--drop", "name,id"], dict(collapse=True, drop=("name", "id"))),
+    (["--simple"], dict(unwrap=True, text_values=True, prefix="@")),
+    (["--simple", "--remove-empty", "--trim", "--collapse-spaces"],
+     dict(unwrap=True, text_values=True, prefix="@", remove_empty=True, trim=True, collapse=True)),
+]
+
+
+def flatten(record) -> dict:
+    """Python model of node::flatten (CSV columns)."""
+    cells: dict[str, str] = {}
+
+    def walk(n, path):
+        if isinstance(n, dict):
+            for k, v in n.items():
+                walk(v, (f"{path}.{k}" if path else k) if k != "#text" else (path or "#text"))
+        elif isinstance(n, list):
+            for x in n:
+                walk(x, path)
+        else:
+            col = path or "value"
+            text = "" if n is None else n
+            cells[col] = cells[col] + "; " + text if col in cells else text
+    walk(record, "")
+    return cells
+
+
+def read(path: str) -> bytes:
+    with open(path, "rb") as f:
+        return f.read()
+
+
+def other_formats(name, path, tag, py, expected_pretty, py_nd, workdir) -> list[str]:
+    problems = []
+    records = json.loads(py)
+    out = lambda n: os.path.join(workdir, n)  # noqa: E731
+
+    # The generic writers must equal the fast path byte for byte.
+    for flag, expected, file in [(None, py, "g.json"), ("--pretty", expected_pretty, "g.pretty.json"), ("--ndjson", py_nd, "g.ndjson")]:
+        ok, got = run_rust(path, out(file), tag, [flag, "--generic"] if flag else ["--generic"])
+        if not ok or got != expected:
+            problems.append(f"{name}: generic {flag or 'compact'} differs\n  expected: {expected[:300]!r}\n  rust:     {str(got)[:300]!r}")
+
+    # JSON in: the compact, pretty and NDJSON outputs read back unchanged.
+    for source, data in [("in.json", py), ("in.pretty.json", expected_pretty), ("in.ndjson", py_nd)]:
+        with open(out(source), "wb") as f:
+            f.write(data)
+        for flag, expected, file in [(None, py, "j.json"), ("--pretty", expected_pretty, "j.pretty.json"), ("--ndjson", py_nd, "j.ndjson")]:
+            ok, got = run_rust(out(source), out(file), None, flag)
+            if not ok or got != expected:
+                problems.append(f"{name}: JSON input {source} -> {flag or 'compact'} differs\n  expected: {expected[:300]!r}\n  rust:     {str(got)[:300]!r}")
+
+    # YAML.
+    if yaml is not None:
+        ok, got = run_rust(path, out("o.yaml"), tag, None)
+        loaded = yaml.safe_load(got) if ok else None
+        if loaded != records:
+            problems.append(f"{name}: YAML does not load as the records\n  yaml: {str(got)[:300]!r}")
+
+    # XML, read back with the same tag.
+    ok, got = run_rust(path, out("o.xml"), tag, None)
+    if ok:
+        ok, back = run_rust(out("o.xml"), out("back.json"), tag.split(":")[-1], None)
+    if not ok or back != py:
+        problems.append(f"{name}: XML output does not convert back\n  xml:  {str(got)[:300]!r}\n  back: {str(back)[:300]!r}")
+
+    # CSV and TSV.
+    flat = [flatten(r) for r in records]
+    columns = list(dict.fromkeys(c for cells in flat for c in cells))
+    expected_rows = [columns] + [[cells.get(c, "") for c in columns] for cells in flat]
+    for ext, delimiter in [("csv", ","), ("tsv", "\t")]:
+        ok, got = run_rust(path, out(f"o.{ext}"), tag, None)
+        rows = list(csv.reader(io.StringIO(got.decode(), newline=""), delimiter=delimiter)) if ok else None
+        if rows != expected_rows:
+            problems.append(f"{name}: {ext.upper()} differs\n  expected: {expected_rows[:3]!r}\n  rust:     {str(got)[:300]!r}")
+
+    # Clean-up options.
+    for flags, model in OPTION_SETS:
+        expected = json_array([model_options(r, **model) for r in records])
+        ok, got = run_rust(path, out("opt.json"), tag, flags)
+        if not ok or got != expected:
+            problems.append(f"{name}: {' '.join(flags)} differs\n  expected: {expected[:300]!r}\n  rust:     {str(got)[:300]!r}")
     return problems
 
 

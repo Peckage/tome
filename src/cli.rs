@@ -3,31 +3,52 @@ use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-use crate::engine::{self, Doc, Error, Format, Progress};
+use crate::engine::{self, Doc, Error, Format, Kind, Progress};
+use crate::node::Options;
 
 const USAGE: &str = "\
 Tome: open, search and convert huge text files.
 
 Usage:
     tome                               open the window
-    tome FILE.xml                      open the window with a file
-    tome INPUT OUTPUT [options]        convert on the command line
+    tome FILE                          open the window with any file
+    tome INPUT OUTPUT [options]        convert XML or JSON on the command line
 
-Options:
-    --tag NAME     element to emit as one record (default: part)
-    --pretty       indented JSON array (like json.dumps(..., indent=2))
-    --ndjson       one JSON object per line
-    --quiet        no progress output
-    -h, --help     show this help
+Input is XML or JSON (a document, NDJSON or concatenated values), detected
+from the content. The output format follows the output file's extension
+(.ndjson .jsonl .yaml .yml .xml .csv .tsv); .json gives compact JSON.
 
-Without --pretty or --ndjson the output is a JSON array with one compact
-record per line.";
+Records:
+    --tag NAME          XML element to emit as one record (default: part)
+    --records PATH      JSON key path holding the records, e.g. data.items;
+                        \"$\" is the whole document (default: the root array,
+                        or the biggest array under the root object)
+
+Format:
+    --format NAME       json, pretty, ndjson, yaml, xml, csv or tsv
+    --pretty            same as --format pretty
+    --ndjson            same as --format ndjson
+
+Clean-up (all off by default):
+    --trim              trim spaces from the start and end of every value
+    --collapse-spaces   turn every run of whitespace into one space
+    --remove-empty      drop empty values, nulls, {} and [] everywhere
+    --unwrap            replace one-item lists by their item
+    --text-values       replace {\"#text\": v} by v
+    --attr-prefix P     put P in front of XML attribute names, e.g. @
+    --drop KEYS         remove these keys everywhere (comma-separated)
+    --simple            --unwrap --text-values --attr-prefix @ (xmltodict style)
+
+Other:
+    --quiet             no progress output
+    -h, --help          show this help";
 
 pub struct Args {
     pub input: PathBuf,
     pub output: PathBuf,
-    pub tag: String,
+    pub selector: Option<String>,
     pub format: Format,
+    pub options: Options,
     pub quiet: bool,
 }
 
@@ -37,55 +58,104 @@ pub enum Command {
     Exit(i32),
 }
 
+fn parse_format(name: &str) -> Option<Format> {
+    match name.to_ascii_lowercase().as_str() {
+        "json" | "compact" => Some(Format::Compact),
+        "pretty" => Some(Format::Pretty),
+        other => Format::from_extension(other),
+    }
+}
+
 pub fn parse(argv: Vec<String>) -> Command {
     let mut positional = Vec::new();
-    let mut tag = String::from("part");
-    let mut pretty = false;
-    let mut ndjson = false;
+    let mut selector: Option<String> = None;
+    let mut format: Option<Format> = None;
+    let mut options = Options::default();
     let mut quiet = false;
     let mut it = argv.into_iter().skip(1);
     while let Some(arg) = it.next() {
-        match arg.as_str() {
+        let (name, inline) = match arg.split_once('=') {
+            Some((n, v)) if n.starts_with("--") => (n.to_string(), Some(v.to_string())),
+            _ => (arg.clone(), None),
+        };
+        let mut value = |what: &str| -> Result<String, Command> {
+            match inline.clone().or_else(|| it.next()) {
+                Some(v) => Ok(v),
+                None => Err(usage_error(&format!("{what} needs a value"))),
+            }
+        };
+        let mut set_format = |f: Format| -> Result<(), Command> {
+            match format {
+                Some(old) if old != f => Err(usage_error("choose one output format")),
+                _ => {
+                    format = Some(f);
+                    Ok(())
+                }
+            }
+        };
+        let step = match name.as_str() {
             "-h" | "--help" => {
                 println!("{USAGE}");
                 return Command::Exit(0);
             }
-            "--pretty" => pretty = true,
-            "--ndjson" => ndjson = true,
-            "--quiet" | "-q" => quiet = true,
-            "--tag" => match it.next() {
-                Some(value) => tag = value,
-                None => return usage_error("--tag needs a value"),
-            },
-            a if a.starts_with("--tag=") => tag = a[6..].to_string(),
-            "--" => positional.extend(it.by_ref()),
-            a if a.starts_with('-') && a.len() > 1 => return usage_error(&format!("unknown option {a}")),
-            _ => positional.push(arg),
+            "--pretty" => set_format(Format::Pretty),
+            "--ndjson" => set_format(Format::Ndjson),
+            "--format" => value("--format").and_then(|v| match parse_format(&v) {
+                Some(f) => set_format(f),
+                None => Err(usage_error(&format!("unknown format {v}"))),
+            }),
+            "--quiet" | "-q" => {
+                quiet = true;
+                Ok(())
+            }
+            "--tag" | "--records" => value(&name).map(|v| selector = Some(v)),
+            "--trim" => Ok(options.trim = true),
+            "--collapse-spaces" => Ok(options.collapse_spaces = true),
+            "--remove-empty" => Ok(options.remove_empty = true),
+            "--unwrap" => Ok(options.unwrap_single = true),
+            "--text-values" => Ok(options.text_values = true),
+            "--attr-prefix" => value("--attr-prefix").map(|v| options.attr_prefix = v),
+            "--drop" => value("--drop").map(|v| {
+                let mut more = Options::default();
+                more.set_drop_keys(&v);
+                options.drop_keys.extend(more.drop_keys);
+            }),
+            "--simple" => {
+                let s = Options::simple();
+                options.unwrap_single = true;
+                options.text_values = true;
+                options.attr_prefix = s.attr_prefix;
+                Ok(())
+            }
+            "--generic" => {
+                // Hidden test hook: force the generic writer path.
+                crate::engine::FORCE_GENERIC.store(true, std::sync::atomic::Ordering::Relaxed);
+                Ok(())
+            }
+            "--" => {
+                positional.extend(it.by_ref());
+                Ok(())
+            }
+            a if a.starts_with('-') && a.len() > 1 => Err(usage_error(&format!("unknown option {a}"))),
+            _ => {
+                positional.push(arg);
+                Ok(())
+            }
+        };
+        if let Err(command) = step {
+            return command;
         }
     }
-    if pretty && ndjson {
-        return usage_error("--pretty and --ndjson cannot be combined");
-    }
-    if tag.is_empty() {
-        return usage_error("--tag cannot be empty");
-    }
-    let format = if pretty {
-        Format::Pretty
-    } else if ndjson {
-        Format::Ndjson
-    } else {
-        Format::Compact
-    };
     match positional.len() {
         0 => Command::Gui(None),
         1 => Command::Gui(Some(PathBuf::from(&positional[0]))),
-        2 => Command::Convert(Args {
-            input: PathBuf::from(&positional[0]),
-            output: PathBuf::from(&positional[1]),
-            tag,
-            format,
-            quiet,
-        }),
+        2 => {
+            let output = PathBuf::from(&positional[1]);
+            let format = format
+                .or_else(|| output.extension().and_then(|e| Format::from_extension(&e.to_string_lossy())))
+                .unwrap_or(Format::Compact);
+            Command::Convert(Args { input: PathBuf::from(&positional[0]), output, selector, format, options, quiet })
+        }
         _ => usage_error("too many arguments"),
     }
 }
@@ -104,6 +174,14 @@ pub fn run(args: Args) -> i32 {
             return 1;
         }
     };
+    let selector = match (&args.selector, doc.kind) {
+        (Some(s), _) => s.trim().to_string(),
+        (None, kind) => kind.default_selector().to_string(),
+    };
+    if doc.kind == Kind::Xml && selector.is_empty() {
+        eprintln!("error: --tag cannot be empty");
+        return 2;
+    }
     let progress = Progress::default();
     let show = !args.quiet && std::io::stderr().is_terminal();
     let total = doc.bytes().len().max(1) as f64;
@@ -122,7 +200,7 @@ pub fn run(args: Args) -> i32 {
                 eprint!("\r\x1b[K");
             })
         });
-        let result = engine::convert(&doc, &args.tag, &args.output, args.format, &progress);
+        let result = engine::convert(&doc, &selector, &args.output, args.format, &args.options, &progress);
         done.store(true, Ordering::Relaxed);
         if let Some(handle) = reporter {
             let _ = handle.join();

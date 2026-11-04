@@ -16,9 +16,9 @@ use std::time::{Duration, Instant};
 use eframe::egui::{self, Align2, Color32, FontId, Key, Rect, RichText, Sense, Stroke, Vec2};
 
 use crate::cli::group;
-use crate::engine::{self, Doc, Error, Format, Progress};
+use crate::engine::{self, Doc, Error, Format, Kind, Progress};
+use crate::node::{Node, Options};
 use crate::text::TextFile;
-use crate::xml::{Obj, Value};
 
 mod textview;
 use textview::TextView;
@@ -118,23 +118,9 @@ enum View {
     Records,
 }
 
-/// Does this file look like XML? Checks the first non-blank character after
-/// any byte order mark, so the record view is only offered when it can work.
-fn looks_like_xml(path: &Path) -> bool {
-    use std::io::Read;
-    let mut head = [0u8; 512];
-    let n = std::fs::File::open(path).and_then(|mut f| f.read(&mut head)).unwrap_or(0);
-    let head = &head[..n];
-    if head.starts_with(b"\xFF\xFE<") || head.starts_with(b"\xFE\xFF\0<") || head.starts_with(b"<\0") || head.starts_with(b"\0<") {
-        return true;
-    }
-    let head = head.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(head);
-    head.iter().find(|b| !b.is_ascii_whitespace()) == Some(&b'<')
-}
-
 struct Indexed {
     tag: String,
-    ranges: engine::Result<Vec<(usize, usize)>>,
+    ranges: engine::Result<(Vec<(usize, usize)>, String)>,
     seconds: f64,
 }
 
@@ -186,104 +172,135 @@ fn one_line(s: &str) -> String {
     out
 }
 
+/// A scalar as shown in the tree, or the text of `{"#text": v}`.
+fn only_text(node: &Node) -> Option<String> {
+    match node {
+        Node::Obj(entries) => match entries.as_slice() {
+            [(k, v)] if k == "#text" && v.is_scalar() => only_text(v),
+            _ => None,
+        },
+        Node::Null => Some("null".into()),
+        n if n.is_scalar() => n.scalar_text().map(|t| one_line(&t)),
+        _ => None,
+    }
+}
+
 /// "id=00123  code=A-B  name=Bolt" for a collapsed object.
-fn summary(obj: &Obj, budget: usize) -> String {
+fn summary(node: &Node, budget: usize) -> String {
+    let entries = match node {
+        Node::Obj(entries) => entries,
+        Node::Arr(items) => return format!("[{} items]", items.len()),
+        scalar => return only_text(scalar).unwrap_or_default(),
+    };
     let mut out = String::new();
-    for (key, value) in &obj.entries {
+    for (key, value) in entries {
         if out.len() > budget {
             out.push_str(" …");
             break;
         }
         let text = match value {
-            Value::Str(s) => s.as_ref().to_string(),
-            Value::List(items) if items.len() == 1 => match only_text(&items[0]) {
-                Some(t) => t.to_string(),
+            Node::Arr(items) if items.len() == 1 => match only_text(&items[0]) {
+                Some(t) => t,
                 None => continue,
             },
-            Value::List(items) => format!("[{}]", items.len()),
+            Node::Arr(items) => format!("[{}]", items.len()),
+            other => match only_text(other) {
+                Some(t) => t,
+                None => continue,
+            },
         };
         if !out.is_empty() {
             out.push_str("   ");
         }
-        if *key == "#text" {
-            out.push_str(&one_line(&text));
-        } else {
+        if key != "#text" {
             out.push_str(key);
             out.push('=');
-            out.push_str(&one_line(&text));
         }
+        out.push_str(&text);
     }
     out
-}
-
-fn only_text<'a>(obj: &'a Obj) -> Option<&'a str> {
-    match obj.entries.as_slice() {
-        [("#text", Value::Str(s))] => Some(s),
-        _ => None,
-    }
 }
 
 /// Flatten a record into display rows. Single-item lists are shown without
 /// an index level and `{"#text": v}` as a plain value, so the tree reads like
 /// "key: value" per line; the JSON panel shows the exact output.
-fn build_rows(obj: &Obj, collapsed: &HashSet<usize>) -> Vec<Row> {
-    let mut rows = Vec::new();
-    let mut node = 0usize;
-    fn walk(obj: &Obj, depth: usize, rows: &mut Vec<Row>, node: &mut usize, collapsed: &HashSet<usize>) {
-        for (key, value) in &obj.entries {
+fn build_rows(record: &Node, collapsed: &HashSet<usize>) -> Vec<Row> {
+    struct Walk<'c> {
+        rows: Vec<Row>,
+        node: usize,
+        collapsed: &'c HashSet<usize>,
+    }
+    impl Walk<'_> {
+        /// `hidden` keeps numbering identical for folded branches.
+        fn entry(&mut self, label: String, value: &Node, depth: usize, hidden: bool) {
             match value {
-                Value::Str(s) => {
-                    *node += 1;
-                    rows.push(Row { depth, key: key.to_string(), value: one_line(s), node: *node, has_children: false, collapsed: false });
-                }
-                Value::List(items) => {
+                Node::Arr(items) if items.is_empty() => self.item(label, value, depth, hidden),
+                Node::Arr(items) => {
                     let many = items.len() > 1;
                     for (i, item) in items.iter().enumerate() {
-                        *node += 1;
-                        let label = if many { format!("{key} [{}]", i + 1) } else { key.to_string() };
-                        if let Some(text) = only_text(item) {
-                            rows.push(Row { depth, key: label, value: one_line(text), node: *node, has_children: false, collapsed: false });
-                        } else if item.entries.is_empty() {
-                            rows.push(Row { depth, key: label, value: String::new(), node: *node, has_children: false, collapsed: false });
-                        } else {
-                            let id = *node;
-                            let is_collapsed = collapsed.contains(&id);
-                            rows.push(Row {
-                                depth,
-                                key: label,
-                                value: if is_collapsed { summary(item, 160) } else { String::new() },
-                                node: id,
-                                has_children: true,
-                                collapsed: is_collapsed,
-                            });
-                            if is_collapsed {
-                                skip(item, node);
-                            } else {
-                                walk(item, depth + 1, rows, node, collapsed);
-                            }
-                        }
+                        let label = if many { format!("{label} [{}]", i + 1) } else { label.clone() };
+                        self.item(label, item, depth, hidden);
                     }
                 }
+                other => self.item(label, other, depth, hidden),
             }
         }
-    }
-    fn skip(obj: &Obj, node: &mut usize) {
-        for (_, value) in &obj.entries {
+
+        fn item(&mut self, key: String, value: &Node, depth: usize, hidden: bool) {
+            self.node += 1;
+            let id = self.node;
+            let leaf = |value: String| Row { depth, key: key.clone(), value, node: id, has_children: false, collapsed: false };
+            let row = if let Some(text) = only_text(value) {
+                leaf(text)
+            } else {
+                match value {
+                    Node::Obj(e) if e.is_empty() => leaf(String::new()),
+                    Node::Arr(a) if a.is_empty() => leaf("[]".into()),
+                    _ => {
+                        let folded = self.collapsed.contains(&id);
+                        let row = Row {
+                            depth,
+                            key: key.clone(),
+                            value: if folded { summary(value, 160) } else { String::new() },
+                            node: id,
+                            has_children: true,
+                            collapsed: folded,
+                        };
+                        if !hidden {
+                            self.rows.push(row);
+                        }
+                        self.children(value, depth + 1, hidden || folded);
+                        return;
+                    }
+                }
+            };
+            if !hidden {
+                self.rows.push(row);
+            }
+        }
+
+        fn children(&mut self, value: &Node, depth: usize, hidden: bool) {
             match value {
-                Value::Str(_) => *node += 1,
-                Value::List(items) => {
-                    for item in items {
-                        *node += 1;
-                        if only_text(item).is_none() {
-                            skip(item, node);
-                        }
+                Node::Obj(entries) => {
+                    for (k, v) in entries {
+                        self.entry(k.to_string(), v, depth, hidden);
                     }
                 }
+                Node::Arr(items) => {
+                    for (i, v) in items.iter().enumerate() {
+                        self.item(format!("[{}]", i + 1), v, depth, hidden);
+                    }
+                }
+                _ => {}
             }
         }
     }
-    walk(obj, 1, &mut rows, &mut node, collapsed);
-    rows
+    let mut walk = Walk { rows: Vec::new(), node: 0, collapsed };
+    match record {
+        Node::Obj(_) | Node::Arr(_) => walk.children(record, 1, false),
+        scalar => walk.item("value".into(), scalar, 1, false),
+    }
+    walk.rows
 }
 
 // ---------------------------------------------------------------------------
@@ -301,8 +318,11 @@ pub struct App {
     doc: Option<Arc<Doc>>,
     lines: Option<u64>,
     open_job: Option<Job<Opened>>,
-    /// True when the file is XML, so the record view and converter apply.
-    is_xml: bool,
+    /// XML or JSON: the record view and converter apply.
+    kind: Option<Kind>,
+    options: Options,
+    /// The "Drop fields" box, applied on Enter.
+    drop_text: String,
 
     text: Option<Arc<TextFile>>,
     text_job: Option<Job<TextOpened>>,
@@ -355,7 +375,9 @@ impl Default for App {
             doc: None,
             lines: None,
             open_job: None,
-            is_xml: false,
+            kind: None,
+            options: Options::default(),
+            drop_text: String::new(),
             text: None,
             text_job: None,
             textview: TextView::default(),
@@ -419,7 +441,18 @@ impl App {
         self.textview.reset();
         self.view_chosen = false;
         self.path = Some(path.clone());
-        self.is_xml = looks_like_xml(&path);
+        let kind = engine::sniff_kind(&path);
+        if let Some(k) = kind {
+            // Keep a tag the user typed, unless it was for the other kind of
+            // file: an XML tag means nothing as a JSON path and vice versa.
+            let typed = self.tag.trim() != self.auto_tag;
+            let switched = self.kind.is_some_and(|old| old != k);
+            if !typed || switched {
+                self.tag = k.default_selector().into();
+                self.auto_tag = self.tag.clone();
+            }
+        }
+        self.kind = kind;
         self.view = View::Text;
         self.output = default_output(&path, self.format);
         self.set_status(format!("Opening {}…", path.display()), false);
@@ -429,10 +462,10 @@ impl App {
             let text = TextFile::open(&text_path).map(Arc::new);
             TextOpened { path: text_path, text, seconds: started.elapsed().as_secs_f64() }
         }));
-        if self.is_xml {
+        if let Some(kind) = kind {
             self.open_job = Some(Job::spawn(ctx, move |_| {
                 let started = Instant::now();
-                let doc = Doc::open(&path).map(Arc::new);
+                let doc = Doc::open_as(&path, kind).map(Arc::new);
                 let guessed_tag = doc.as_ref().ok().and_then(|d| d.guess_record_tag());
                 Opened { path, doc, guessed_tag, seconds: started.elapsed().as_secs_f64() }
             }));
@@ -454,7 +487,7 @@ impl App {
     fn start_index(&mut self, ctx: &egui::Context) {
         let Some(doc) = self.doc.clone() else { return };
         let tag = self.tag.trim().to_string();
-        if tag.is_empty() {
+        if tag.is_empty() && doc.kind == Kind::Xml {
             return;
         }
         self.reset_view();
@@ -462,7 +495,7 @@ impl App {
         self.indexed_tag = tag.clone();
         self.index_job = Some(Job::spawn(ctx, move |_| {
             let started = Instant::now();
-            let ranges = engine::index_records(&doc, &tag);
+            let ranges = engine::index(&doc, &tag);
             Indexed { tag, ranges, seconds: started.elapsed().as_secs_f64() }
         }));
     }
@@ -480,9 +513,10 @@ impl App {
             self.after_view_change();
             return;
         }
+        let options = self.options.clone();
         self.search_job = Some(Job::spawn(ctx, move |progress| {
             let started = Instant::now();
-            let hits = engine::search(&doc, &ranges, &needle, progress);
+            let hits = engine::search(&doc, &ranges, &needle, &options, progress);
             Searched { needle, hits, seconds: started.elapsed().as_secs_f64() }
         }));
     }
@@ -505,12 +539,13 @@ impl App {
             return;
         }
         self.confirm_overwrite = false;
-        let tag = self.tag.trim().to_string();
+        let tag = self.indexed_tag.clone();
         let format = self.format;
+        let options = self.options.clone();
         self.set_status("Converting…", false);
         self.convert_job = Some(Job::spawn(ctx, move |progress| {
             let started = Instant::now();
-            let result = engine::convert(&doc, &tag, &output, format, progress);
+            let result = engine::convert(&doc, &tag, &output, format, &options, progress);
             Converted { output, result, seconds: started.elapsed().as_secs_f64() }
         }));
     }
@@ -576,10 +611,28 @@ impl App {
         view_pos + segs.iter().filter(|s| s.0 < view_pos).map(|s| s.1).sum::<usize>()
     }
 
-    fn parse_record(&self, record: u32) -> Option<Obj<'_>> {
+    fn parse_record(&self, record: u32) -> Option<Node<'_>> {
         let doc = self.doc.as_ref()?;
         let range = *self.ranges.as_ref()?.get(record as usize)?;
-        engine::parse_record(doc, range).ok()
+        engine::parse_node(doc, range, &self.options).ok()
+    }
+
+    /// The clean-up options changed: everything shown per record is stale.
+    fn options_changed(&mut self, ctx: &egui::Context) {
+        self.summaries.clear();
+        let open: Vec<u32> = self.expanded.keys().copied().collect();
+        self.expanded.clear();
+        for record in open {
+            self.toggle_record(record);
+        }
+        if let Some(record) = self.selected {
+            self.selected_json = None;
+            self.select(record);
+        }
+        if !self.searched_for.is_empty() {
+            self.search = self.searched_for.clone();
+            self.start_search(ctx);
+        }
     }
 
     fn toggle_record(&mut self, record: u32) {
@@ -611,7 +664,7 @@ impl App {
         }
         let (Some(doc), Some(ranges)) = (&self.doc, &self.ranges) else { return };
         if let Some(&range) = ranges.get(record as usize) {
-            let json = engine::record_json(doc, range, true).unwrap_or_else(|e| format!("error: {e}"));
+            let json = engine::record_json(doc, range, true, &self.options).unwrap_or_else(|e| format!("error: {e}"));
             self.selected_json = Some((record, json));
         }
     }
@@ -642,7 +695,7 @@ impl App {
                 match done.text {
                     Ok(text) => {
                         self.lines = Some(text.line_count() as u64);
-                        if !self.is_xml {
+                        if self.kind.is_none() {
                             self.set_status(
                                 format!("Opened {} lines in {:.2} s.", group(text.line_count() as u64), done.seconds),
                                 false,
@@ -672,7 +725,10 @@ impl App {
                         self.set_status(format!("Opened in {:.2} s{note}.", done.seconds), false);
                         self.start_index(ctx);
                     }
-                    Err(e) => self.set_status(format!("Not readable as XML: {e}. The text view still works."), true),
+                    Err(e) => {
+                        let kind = self.kind.map_or("XML", Kind::name);
+                        self.set_status(format!("Not readable as {kind}: {e}. The text view still works."), true);
+                    }
                 }
             }
         }
@@ -680,7 +736,18 @@ impl App {
         if let Some(done) = self.index_job.as_ref().and_then(Job::poll) {
             self.index_job = None;
             if done.tag == self.indexed_tag {
-                match done.ranges {
+                let is_json = self.doc.as_ref().is_some_and(|d| d.kind == Kind::Json);
+                let ranges = done.ranges.map(|(r, used)| {
+                    // An automatic JSON path: show which one was picked.
+                    if is_json && done.tag.is_empty() {
+                        self.tag = used.clone();
+                        self.auto_tag = used.clone();
+                        self.indexed_tag = used;
+                    }
+                    r
+                });
+                let what = if is_json { self.indexed_tag.clone() } else { format!("<{}>", done.tag) };
+                match ranges {
                     Ok(r) if r.is_empty() => {
                         let hint = self
                             .doc
@@ -690,7 +757,8 @@ impl App {
                             .map(|t| format!(" The first repeating element is <{t}>."))
                             .unwrap_or_default();
                         self.ranges = Some(Arc::new(r));
-                        self.set_status(format!("No <{}> elements found.{hint}", done.tag), true);
+                        let message = if is_json { format!("No records found at \"{what}\".") } else { format!("No {what} elements found.{hint}") };
+                        self.set_status(message, true);
                     }
                     Ok(r) => {
                         let n = r.len();
@@ -699,13 +767,14 @@ impl App {
                             self.view = View::Records;
                         }
                         self.set_status(
-                            format!("Indexed {} <{}> records in {:.2} s.", group(n as u64), done.tag, done.seconds),
+                            format!("Indexed {} {} records in {:.2} s.", group(n as u64), what, done.seconds),
                             false,
                         );
                     }
                     Err(e) => {
                         self.ranges = None;
-                        self.set_status(format!("XML error: {e}"), true);
+                        let kind = self.kind.map_or("XML", Kind::name);
+                        self.set_status(format!("{kind} error: {e}"), true);
                     }
                 }
             }
@@ -842,9 +911,10 @@ impl App {
         egui::Panel::top("file").show(ui, |ui| {
             ui.add_space(6.0);
             self.file_bar(ui);
-            if self.is_xml {
+            if self.kind.is_some() {
                 ui.add_space(2.0);
                 self.convert_bar(ui);
+                self.options_bar(ui);
             }
             ui.add_space(6.0);
         });
@@ -864,10 +934,10 @@ impl App {
                         self.view = View::Text;
                         self.view_chosen = true;
                     }
-                    if self.is_xml
+                    if self.kind.is_some()
                         && ui
                             .selectable_label(self.view == View::Records, "Records")
-                            .on_hover_text("One row per XML record, with the JSON it converts to")
+                            .on_hover_text("One row per record, with the JSON it converts to")
                             .clicked()
                     {
                         self.view = View::Records;
@@ -932,8 +1002,18 @@ impl App {
         let has_doc = self.doc.is_some();
         let converting = self.convert_job.is_some();
         ui.horizontal(|ui| {
-            ui.label("Record tag");
-            let tag = ui.add_enabled(!converting, egui::TextEdit::singleline(&mut self.tag).desired_width(110.0));
+            let json = self.kind == Some(Kind::Json);
+            ui.label(if json { "Records at" } else { "Record tag" });
+            let tag = ui
+                .add_enabled(
+                    !converting,
+                    egui::TextEdit::singleline(&mut self.tag).desired_width(110.0).hint_text(if json { "auto" } else { "tag" }),
+                )
+                .on_hover_text(if json {
+                    "Key path to the array of records, e.g. data.items. Empty: the root array or the biggest array under the root. $: the whole file as one record. lines: one record per line (NDJSON)."
+                } else {
+                    "The XML element that is one record"
+                });
             if tag.changed() {
                 self.tag_edited_at = Some(Instant::now());
             }
@@ -948,17 +1028,22 @@ impl App {
             let before = self.format;
             ui.add_enabled_ui(!converting, |ui| {
                 egui::ComboBox::from_id_salt("format")
-                    .selected_text(format_name(self.format))
+                    .selected_text(self.format.name())
                     .show_ui(ui, |ui| {
-                        for f in [Format::Pretty, Format::Compact, Format::Ndjson] {
-                            ui.selectable_value(&mut self.format, f, format_name(f));
+                        for f in Format::ALL {
+                            ui.selectable_value(&mut self.format, f, f.name());
                         }
                     });
             });
             if self.format != before {
                 if let Some((stem, ext)) = self.output.rsplit_once('.') {
-                    if ext == "json" || ext == "ndjson" {
+                    let known = ext == "json" || Format::from_extension(ext).is_some();
+                    if known && !stem.ends_with(['/', '\\']) {
+                        let input = self.path.clone();
                         self.output = format!("{stem}.{}", self.format.extension());
+                        if let Some(input) = input.filter(|p| Path::new(&self.output) == p.as_path()) {
+                            self.output = default_output(&input, self.format);
+                        }
                     }
                 }
             }
@@ -996,6 +1081,57 @@ impl App {
                 egui::ProgressBar::new(fraction)
                     .text(format!("{:.0}%  ·  {} records  ·  {:.1} s", fraction * 100.0, group(records), job.started.elapsed().as_secs_f32())),
             );
+        }
+    }
+
+    /// Clean-up options: they change the converted output, the JSON panel,
+    /// the tree and what search matches.
+    fn options_bar(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        let converting = self.convert_job.is_some();
+        let before = self.options.clone();
+        ui.horizontal(|ui| {
+            ui.add_enabled_ui(!converting, |ui| {
+                ui.label("Clean up");
+                ui.checkbox(&mut self.options.trim, "Trim").on_hover_text("Remove spaces at the start and end of every value");
+                ui.checkbox(&mut self.options.collapse_spaces, "Collapse spaces").on_hover_text("Turn runs of spaces, tabs and newlines into one space");
+                ui.checkbox(&mut self.options.remove_empty, "Remove empty").on_hover_text("Drop empty values, nulls, {} and [] everywhere (records themselves are kept)");
+                ui.separator();
+                ui.label("Shape");
+                ui.checkbox(&mut self.options.unwrap_single, "Unwrap 1-item lists").on_hover_text("[x] becomes x");
+                ui.checkbox(&mut self.options.text_values, "Text as value").on_hover_text("{\"#text\": v} becomes v");
+                if self.kind == Some(Kind::Xml) {
+                    ui.label("Attr. prefix");
+                    ui.add(egui::TextEdit::singleline(&mut self.options.attr_prefix).desired_width(28.0).hint_text("@"))
+                        .on_hover_text("Put this in front of attribute names, e.g. @ (xmltodict style)");
+                }
+                ui.separator();
+                ui.label("Drop fields");
+                let field = ui.add(
+                    egui::TextEdit::singleline(&mut self.drop_text)
+                        .desired_width(150.0)
+                        .hint_text("key1, key2 (Enter)"),
+                );
+                if field.lost_focus() {
+                    self.options.set_drop_keys(&self.drop_text);
+                }
+                ui.separator();
+                if ui.button("Simple").on_hover_text("xmltodict style: @attributes, plain text values, no one-item lists").clicked() {
+                    let keep = (self.options.trim, self.options.collapse_spaces, self.options.remove_empty, self.options.drop_keys.clone());
+                    self.options = Options::simple();
+                    (self.options.trim, self.options.collapse_spaces, self.options.remove_empty, self.options.drop_keys) = keep;
+                    if self.kind != Some(Kind::Xml) {
+                        self.options.attr_prefix.clear();
+                    }
+                }
+                if ui.add_enabled(!self.options.is_plain(), egui::Button::new("Reset")).on_hover_text("Back to the plain mapping").clicked() {
+                    self.options = Options::default();
+                    self.drop_text.clear();
+                }
+            });
+        });
+        if self.options != before {
+            self.options_changed(&ctx);
         }
     }
 
@@ -1252,16 +1388,15 @@ fn scrollbar(ui: &mut egui::Ui, bar: Rect, top: usize, total: usize, visible: us
     None
 }
 
-fn format_name(f: Format) -> &'static str {
-    match f {
-        Format::Pretty => "Pretty JSON",
-        Format::Compact => "Compact JSON",
-        Format::Ndjson => "NDJSON",
-    }
-}
-
+/// `parts.xml` → `parts.json`; when that would be the input itself
+/// (`data.json` → JSON) it becomes `data-converted.json`.
 fn default_output(input: &Path, format: Format) -> String {
-    input.with_extension(format.extension()).display().to_string()
+    let out = input.with_extension(format.extension());
+    if out == input {
+        let stem = input.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        return input.with_file_name(format!("{stem}-converted.{}", format.extension())).display().to_string();
+    }
+    out.display().to_string()
 }
 
 impl eframe::App for App {
@@ -1437,7 +1572,7 @@ mod tests {
         let mut app = App::default();
         app.open(path, &ctx);
         wait(&ctx, &mut app, |a| a.text_job.is_none());
-        assert!(!app.is_xml);
+        assert!(app.kind.is_none());
         assert!(app.open_job.is_none(), "no XML parsing for a text file");
         assert_eq!(app.view, View::Text);
         assert_eq!(app.lines, Some(50_000));
@@ -1471,6 +1606,55 @@ mod tests {
         for _ in 0..3 {
             frame(&ctx, &mut app, vec![egui::Event::Key { key: Key::PageDown, physical_key: None, pressed: true, repeat: false, modifiers: Default::default() }]);
         }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn json_records_options_and_formats() {
+        let dir = temp_dir("json");
+        let path = dir.join("data.json");
+        let mut items = Vec::new();
+        for i in 0..3000 {
+            items.push(format!(r#"{{"id":"{i:04}","name":"  Bolt {i} ","note":"","tags":["a"],"n":{i}.5}}"#));
+        }
+        std::fs::write(&path, format!(r#"{{"meta":{{"v":1}},"items":[{}]}}"#, items.join(","))).unwrap();
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.open(path.clone(), &ctx);
+        wait(&ctx, &mut app, |a| a.open_job.is_none() && a.index_job.is_none() && a.text_job.is_none());
+        assert_eq!(app.kind, Some(Kind::Json));
+        assert_eq!(app.tag, "items", "the biggest array is picked and shown");
+        assert_eq!(app.ranges.as_ref().unwrap().len(), 3000);
+        assert_eq!(app.view, View::Records);
+        assert!(app.output.ends_with("data-converted.json"), "{}", app.output);
+
+        app.toggle_record(1);
+        let rows: Vec<_> = app.expanded[&1].rows.iter().map(|r| (r.key.clone(), r.value.clone())).collect();
+        assert_eq!(rows[0], ("id".to_string(), "0001".to_string()));
+        assert!(rows.contains(&("tags".to_string(), "a".to_string())));
+        assert!(rows.contains(&("n".to_string(), "1.5".to_string())));
+        app.select(1);
+        frame(&ctx, &mut app, vec![]);
+
+        // Options change the panel and the tree right away.
+        app.options.trim = true;
+        app.options.remove_empty = true;
+        app.options.unwrap_single = true;
+        app.options_changed(&ctx);
+        let json = &app.selected_json.as_ref().unwrap().1;
+        assert_eq!(json, "{\n  \"id\": \"0001\",\n  \"name\": \"Bolt 1\",\n  \"tags\": \"a\",\n  \"n\": 1.5\n}");
+        assert!(app.expanded.contains_key(&1), "expanded records stay open");
+
+        // Convert to CSV with the options.
+        app.format = Format::Csv;
+        app.output = dir.join("out.csv").display().to_string();
+        app.start_convert(&ctx, false);
+        wait(&ctx, &mut app, |a| a.convert_job.is_none());
+        assert!(app.status.text.starts_with("Wrote 3,000 records"), "{}", app.status.text);
+        let csv = std::fs::read_to_string(dir.join("out.csv")).unwrap();
+        let mut lines = csv.lines();
+        assert_eq!(lines.next(), Some("id,name,tags,n"));
+        assert_eq!(lines.next(), Some("0000,Bolt 0,a,0.5"));
         let _ = std::fs::remove_dir_all(dir);
     }
 

@@ -10,6 +10,7 @@
 //!
 //! Both channels are bounded, so memory stays flat however large the input.
 
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs::File;
 use std::io::{self, Write};
@@ -20,7 +21,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use rayon::prelude::*;
 
 use crate::json;
-use crate::xml::{self, Entities, XmlError};
+use crate::jsonin;
+use crate::node::{self, Node, Options, XmlScalars, XmlStyle};
+use crate::xml::{self, Entities, XResult, XmlError};
 
 // ---------------------------------------------------------------------------
 // Documents
@@ -31,9 +34,53 @@ enum Data {
     Owned(Vec<u8>),
 }
 
+/// What kind of records a file holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    Xml,
+    /// A JSON document, NDJSON, or concatenated JSON values.
+    Json,
+}
+
+impl Kind {
+    pub fn name(self) -> &'static str {
+        match self {
+            Kind::Xml => "XML",
+            Kind::Json => "JSON",
+        }
+    }
+
+    /// What selects the records: a tag name, or a key path.
+    pub fn default_selector(self) -> &'static str {
+        match self {
+            Kind::Xml => "part",
+            Kind::Json => "",
+        }
+    }
+}
+
+/// Guess the kind from the first non-blank character: `<` is XML, `{` or
+/// `[` is JSON. `None` for anything else (plain text).
+pub fn sniff_kind(path: &Path) -> Option<Kind> {
+    use std::io::Read;
+    let mut head = [0u8; 512];
+    let n = File::open(path).and_then(|mut f| f.read(&mut head)).unwrap_or(0);
+    let head = &head[..n];
+    if head.starts_with(b"\xFF\xFE<") || head.starts_with(b"\xFE\xFF\0<") || head.starts_with(b"<\0") || head.starts_with(b"\0<") {
+        return Some(Kind::Xml);
+    }
+    let head = head.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(head);
+    match head.iter().find(|b| !b.is_ascii_whitespace()) {
+        Some(b'<') => Some(Kind::Xml),
+        Some(b'{' | b'[') => Some(Kind::Json),
+        _ => None,
+    }
+}
+
 /// An input file, memory-mapped (or transcoded to UTF-8 in memory when it is
 /// not UTF-8), validated, with its DTD entities read.
 pub struct Doc {
+    pub kind: Kind,
     data: Data,
     pub path: PathBuf,
     /// Size of the file on disk.
@@ -77,7 +124,12 @@ impl From<io::Error> for Error {
 pub type Result<T> = std::result::Result<T, Error>;
 
 impl Doc {
+    /// Open as the kind the content suggests (XML when unsure).
     pub fn open(path: &Path) -> Result<Doc> {
+        Doc::open_as(path, sniff_kind(path).unwrap_or(Kind::Xml))
+    }
+
+    pub fn open_as(path: &Path, kind: Kind) -> Result<Doc> {
         let file = File::open(path)?;
         let file_size = file.metadata()?.len();
         let data = if file_size == 0 {
@@ -89,6 +141,7 @@ impl Doc {
             Data::Mapped(unsafe { memmap2::MmapOptions::new().map(&file)? })
         };
         let mut doc = Doc {
+            kind,
             data,
             path: path.to_path_buf(),
             file_size,
@@ -108,6 +161,15 @@ impl Doc {
     }
 
     fn prepare(&mut self) -> Result<()> {
+        if self.kind == Kind::Json {
+            if self.bytes().starts_with(b"\xEF\xBB\xBF") {
+                self.origin = 3;
+            }
+            if let Err(offset) = validate_chars(self.bytes(), false) {
+                return Err(self.xml_error(XmlError::new(offset, "invalid UTF-8")));
+            }
+            return Ok(());
+        }
         if let Some((label, bom)) = detect_encoding(self.bytes()) {
             let decoded = transcode(&self.bytes()[bom..], &label)?;
             self.data = Data::Owned(decoded.into_bytes());
@@ -116,7 +178,7 @@ impl Doc {
         } else if self.bytes().starts_with(b"\xEF\xBB\xBF") {
             self.origin = 3;
         }
-        if let Err(offset) = validate_chars(self.bytes()) {
+        if let Err(offset) = validate_chars(self.bytes(), true) {
             return Err(self.xml_error(XmlError::new(offset, "not well-formed (invalid token)")));
         }
         self.entities = xml::read_prolog(self.bytes(), self.origin).map_err(|e| self.xml_error(e))?;
@@ -128,8 +190,13 @@ impl Doc {
         Error::Xml { message: e.message, line, column }
     }
 
+    /// The XML element that probably holds the records. For JSON the
+    /// records are found when indexing with an empty selector.
     pub fn guess_record_tag(&self) -> Option<String> {
-        xml::guess_record_tag(self.bytes(), self.origin, 20_000)
+        match self.kind {
+            Kind::Xml => xml::guess_record_tag(self.bytes(), self.origin, 20_000),
+            Kind::Json => None,
+        }
     }
 }
 
@@ -178,9 +245,9 @@ fn transcode(bytes: &[u8], label: &str) -> Result<String> {
     Ok(text.into_owned())
 }
 
-/// Check UTF-8 and the XML 1.0 character set in parallel. Returns the offset
-/// of the first bad byte.
-fn validate_chars(b: &[u8]) -> std::result::Result<(), usize> {
+/// Check UTF-8 (and with `xml`, the XML 1.0 character set) in parallel.
+/// Returns the offset of the first bad byte.
+fn validate_chars(b: &[u8], xml: bool) -> std::result::Result<(), usize> {
     const CHUNK: usize = 4 << 20;
     let mut bounds = vec![0];
     let mut at = CHUNK;
@@ -202,6 +269,9 @@ fn validate_chars(b: &[u8]) -> std::result::Result<(), usize> {
                 Ok(_) => None,
                 Err(e) => Some(e.valid_up_to()),
             };
+            if !xml {
+                return bad.map(|i| start + i);
+            }
             let limit = bad.unwrap_or(chunk.len());
             if let Some(i) = chunk[..limit].iter().position(|&c| c < 0x20 && !matches!(c, b'\t' | b'\n' | b'\r')) {
                 bad = Some(i);
@@ -270,17 +340,64 @@ pub enum Format {
     Pretty,
     /// One compact JSON object per line.
     Ndjson,
+    /// A YAML sequence, one item per record. Strings are always quoted.
+    Yaml,
+    /// `<records>` with one element per record.
+    Xml,
+    /// One row per record, nested keys flattened into columns.
+    Csv,
+    Tsv,
 }
 
 impl Format {
+    pub const ALL: [Format; 7] = [Format::Pretty, Format::Compact, Format::Ndjson, Format::Yaml, Format::Xml, Format::Csv, Format::Tsv];
+
     pub fn extension(self) -> &'static str {
         match self {
+            Format::Compact | Format::Pretty => "json",
             Format::Ndjson => "ndjson",
-            _ => "json",
+            Format::Yaml => "yaml",
+            Format::Xml => "xml",
+            Format::Csv => "csv",
+            Format::Tsv => "tsv",
         }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Format::Pretty => "Pretty JSON",
+            Format::Compact => "Compact JSON",
+            Format::Ndjson => "NDJSON",
+            Format::Yaml => "YAML",
+            Format::Xml => "XML",
+            Format::Csv => "CSV",
+            Format::Tsv => "TSV",
+        }
+    }
+
+    /// The format an output file name asks for. `.json` is not listed: it
+    /// could be compact or pretty, so the caller decides.
+    pub fn from_extension(ext: &str) -> Option<Format> {
+        match ext.to_ascii_lowercase().as_str() {
+            "ndjson" | "jsonl" => Some(Format::Ndjson),
+            "yaml" | "yml" => Some(Format::Yaml),
+            "xml" => Some(Format::Xml),
+            "csv" => Some(Format::Csv),
+            "tsv" | "tab" => Some(Format::Tsv),
+            _ => None,
+        }
+    }
+
+    pub fn is_json(self) -> bool {
+        matches!(self, Format::Compact | Format::Pretty | Format::Ndjson)
+    }
+
+    pub fn is_table(self) -> bool {
+        matches!(self, Format::Csv | Format::Tsv)
     }
 }
 
+/// The fast path: XML mapping straight to JSON, no options.
 fn encode_record(out: &mut Vec<u8>, obj: &xml::Obj, format: Format, first: bool) {
     match format {
         Format::Compact => {
@@ -294,6 +411,63 @@ fn encode_record(out: &mut Vec<u8>, obj: &xml::Obj, format: Format, first: bool)
         Format::Ndjson => {
             json::write_compact(out, obj);
             out.push(b'\n');
+        }
+        _ => unreachable!("only JSON formats take the fast path"),
+    }
+}
+
+/// Everything a worker needs to encode generic records.
+struct Encoder<'a> {
+    format: Format,
+    record_name: &'a str,
+    xml_style: XmlStyle<'a>,
+    columns: HashMap<&'a str, usize>,
+    width: usize,
+}
+
+impl Encoder<'_> {
+    fn encode(&self, out: &mut Vec<u8>, node: &Node, first: bool) {
+        match self.format {
+            Format::Compact => {
+                out.extend_from_slice(if first { b"\n" } else { b",\n" });
+                node::write_json_compact(out, node);
+            }
+            Format::Pretty => {
+                out.extend_from_slice(if first { b"\n  " } else { b",\n  " });
+                node::write_json_pretty(out, node, 2);
+            }
+            Format::Ndjson => {
+                node::write_json_compact(out, node);
+                out.push(b'\n');
+            }
+            Format::Yaml => node::write_yaml_record(out, node),
+            Format::Xml => {
+                out.extend_from_slice(b"  ");
+                node::write_xml_element(out, self.record_name, node, 2, &self.xml_style);
+                out.push(b'\n');
+            }
+            Format::Csv | Format::Tsv => {
+                let delimiter = if self.format == Format::Csv { b',' } else { b'\t' };
+                let mut cells = Vec::new();
+                node::flatten(node, &mut cells);
+                let mut row: Vec<&str> = vec![""; self.width];
+                for (column, value) in &cells {
+                    if let Some(&i) = self.columns.get(column.as_str()) {
+                        row[i] = value;
+                    }
+                }
+                if self.width == 1 && row[0].is_empty() {
+                    // An empty line would be read as no row at all.
+                    out.extend_from_slice(b"\"\"");
+                }
+                for (i, cell) in row.iter().enumerate() {
+                    if i > 0 {
+                        out.push(delimiter);
+                    }
+                    node::write_csv_field(out, cell, delimiter);
+                }
+                out.push(b'\n');
+            }
         }
     }
 }
@@ -320,7 +494,8 @@ pub fn scan(doc: &Doc, tag: &str) -> crate::pscan::ScanResult {
 }
 
 /// Convert `doc` to `output`. Returns the number of records written.
-pub fn convert(doc: &Doc, tag: &str, output: &Path, format: Format, progress: &Progress) -> Result<u64> {
+/// `selector` is the record tag (XML) or key path (JSON, "" = automatic).
+pub fn convert(doc: &Doc, selector: &str, output: &Path, format: Format, options: &Options, progress: &Progress) -> Result<u64> {
     if same_file(&doc.path, output) {
         return Err(Error::Other("output must be a different file from the input".into()));
     }
@@ -328,7 +503,7 @@ pub fn convert(doc: &Doc, tag: &str, output: &Path, format: Format, progress: &P
     temporary.push(".tmp");
     let temporary = PathBuf::from(temporary);
 
-    match convert_to(doc, tag, &temporary, format, progress) {
+    match convert_to(doc, selector, &temporary, format, options, progress) {
         Ok(count) => {
             std::fs::rename(&temporary, output)?;
             Ok(count)
@@ -349,19 +524,135 @@ fn same_file(a: &Path, b: &Path) -> bool {
 
 const BATCH: usize = 2048;
 
-fn convert_to(doc: &Doc, tag: &str, temporary: &Path, format: Format, progress: &Progress) -> Result<u64> {
+/// Find the records: their byte ranges, plus (XML only) a structural error
+/// found after the last good record, reported once those are written.
+/// Also returns the selector that was used (the automatic JSON path).
+fn records(doc: &Doc, selector: &str) -> Result<(Vec<(usize, usize)>, Option<XmlError>, String)> {
+    match doc.kind {
+        Kind::Xml => {
+            let scanned = scan(doc, selector);
+            Ok((scanned.ranges, scanned.error, selector.to_string()))
+        }
+        Kind::Json => {
+            // An .ndjson/.jsonl file is one record per line even when it
+            // holds a single object that would look like a whole document.
+            let lines = doc.path.extension().is_some_and(|e| matches!(e.to_string_lossy().to_ascii_lowercase().as_str(), "ndjson" | "jsonl"));
+            let selector = if selector.is_empty() && lines { "lines" } else { selector };
+            let located = jsonin::locate(doc.bytes(), doc.origin, selector).map_err(|e| doc.xml_error(e))?;
+            Ok((located.ranges, None, located.path))
+        }
+    }
+}
+
+/// Parse one record into the generic model with the options applied.
+fn node_of<'d>(doc: &'d Doc, range: (usize, usize), options: &Options) -> XResult<Node<'d>> {
+    let node = match doc.kind {
+        Kind::Xml => node::from_obj(xml::parse_record(doc.bytes(), range, &doc.entities)?, &options.attr_prefix),
+        Kind::Json => jsonin::parse(doc.bytes(), range)?,
+    };
+    Ok(options.apply(node))
+}
+
+/// Does this record go through the original XML-to-JSON writers?
+fn fast_path(doc: &Doc, options: &Options) -> bool {
+    doc.kind == Kind::Xml && options.is_plain() && !FORCE_GENERIC.load(Ordering::Relaxed)
+}
+
+/// Test hook: send every record through the generic model, to prove it
+/// writes the same bytes as the fast path.
+pub static FORCE_GENERIC: AtomicBool = AtomicBool::new(false);
+
+/// CSV columns: every flattened key, in order of first appearance.
+fn collect_columns(doc: &Doc, ranges: &[(usize, usize)], options: &Options, progress: &Progress) -> Result<Vec<String>> {
+    let per_batch: Vec<XResult<Vec<String>>> = ranges
+        .par_chunks(BATCH)
+        .map(|batch| {
+            let mut seen = HashSet::new();
+            let mut order = Vec::new();
+            let mut cells = Vec::new();
+            if progress.cancelled() {
+                return Ok(order);
+            }
+            for &range in batch {
+                cells.clear();
+                node::flatten(&node_of(doc, range, options)?, &mut cells);
+                for (column, _) in cells.drain(..) {
+                    if seen.insert(column.clone()) {
+                        order.push(column);
+                    }
+                }
+            }
+            Ok(order)
+        })
+        .collect();
+    let mut seen = HashSet::new();
+    let mut columns = Vec::new();
+    for batch in per_batch {
+        for column in batch.map_err(|e| doc.xml_error(e))? {
+            if seen.insert(column.clone()) {
+                columns.push(column);
+            }
+        }
+    }
+    if progress.cancelled() {
+        return Err(Error::Cancelled);
+    }
+    Ok(columns)
+}
+
+fn convert_to(doc: &Doc, selector: &str, temporary: &Path, format: Format, options: &Options, progress: &Progress) -> Result<u64> {
     let file = File::create(temporary)?;
-    let scanned = scan(doc, tag);
-    let ranges = &scanned.ranges;
+    let (ranges, late_error, _) = records(doc, selector)?;
+    let ranges = &ranges;
     if progress.cancelled() {
         return Err(Error::Cancelled);
     }
     if ranges.is_empty() {
-        return Err(match scanned.error {
+        return Err(match late_error {
             Some(e) => doc.xml_error(e),
-            None => Error::NoRecords(tag.to_string()),
+            None => Error::NoRecords(selector.to_string()),
         });
     }
+
+    let fast = fast_path(doc, options) && format.is_json();
+    let columns = if format.is_table() { collect_columns(doc, ranges, options, progress)? } else { Vec::new() };
+    let record_name = match doc.kind {
+        Kind::Xml => xml::local_name(selector),
+        Kind::Json => "record",
+    };
+    let encoder = Encoder {
+        format,
+        record_name,
+        xml_style: XmlStyle {
+            scalars: if doc.kind == Kind::Xml { XmlScalars::Attributes } else { XmlScalars::Elements },
+            attr_prefix: &options.attr_prefix,
+        },
+        columns: columns.iter().enumerate().map(|(i, c)| (c.as_str(), i)).collect(),
+        width: columns.len(),
+    };
+    let mut header = Vec::new();
+    let footer: &[u8] = match format {
+        Format::Compact | Format::Pretty => {
+            header.push(b'[');
+            b"\n]\n"
+        }
+        Format::Xml => {
+            header.extend_from_slice(b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<records>\n");
+            b"</records>\n"
+        }
+        Format::Csv | Format::Tsv => {
+            let delimiter = if format == Format::Csv { b',' } else { b'\t' };
+            for (i, c) in columns.iter().enumerate() {
+                if i > 0 {
+                    header.push(delimiter);
+                }
+                node::write_csv_field(&mut header, c, delimiter);
+            }
+            header.push(b'\n');
+            b""
+        }
+        Format::Ndjson | Format::Yaml => b"",
+    };
 
     let bytes = doc.bytes();
     let window = BATCH * worker_count() * 2;
@@ -370,18 +661,14 @@ fn convert_to(doc: &Doc, tag: &str, temporary: &Path, format: Format, progress: 
     std::thread::scope(|scope| -> Result<()> {
         // Writer thread: writing overlaps with encoding the next window.
         let writer = scope.spawn(move || -> io::Result<()> {
-            let mut file = file;
-            if format != Format::Ndjson {
-                file.write_all(b"[")?;
-            }
+            let mut file = io::BufWriter::with_capacity(1 << 20, file);
+            file.write_all(&header)?;
             for chunks in rx {
                 for chunk in chunks {
                     file.write_all(&chunk)?;
                 }
             }
-            if format != Format::Ndjson {
-                file.write_all(b"\n]\n")?;
-            }
+            file.write_all(footer)?;
             file.flush()
         });
 
@@ -398,8 +685,14 @@ fn convert_to(doc: &Doc, tag: &str, temporary: &Path, format: Format, progress: 
                 .map(|(b, batch)| {
                     let mut out = Vec::with_capacity(batch.iter().map(|r| r.1 - r.0).sum::<usize>() * 2);
                     for (i, &range) in batch.iter().enumerate() {
-                        let obj = xml::parse_record(bytes, range, &doc.entities)?;
-                        encode_record(&mut out, &obj, format, base + b * BATCH + i == 0);
+                        let first = base + b * BATCH + i == 0;
+                        if fast {
+                            let obj = xml::parse_record(bytes, range, &doc.entities)?;
+                            encode_record(&mut out, &obj, format, first);
+                        } else {
+                            let node = node_of(doc, range, options)?;
+                            encoder.encode(&mut out, &node, first);
+                        }
                     }
                     Ok(out)
                 })
@@ -430,7 +723,7 @@ fn convert_to(doc: &Doc, tag: &str, temporary: &Path, format: Format, progress: 
         Ok(())
     })?;
 
-    if let Some(e) = scanned.error {
+    if let Some(e) = late_error {
         return Err(doc.xml_error(e));
     }
     progress.bytes.store(bytes.len() as u64, Ordering::Relaxed);
@@ -442,32 +735,53 @@ fn convert_to(doc: &Doc, tag: &str, temporary: &Path, format: Format, progress: 
 // ---------------------------------------------------------------------------
 
 /// Byte ranges of every record, for random access.
-pub fn index_records(doc: &Doc, tag: &str) -> Result<Vec<(usize, usize)>> {
-    let scanned = scan(doc, tag);
-    match scanned.error {
-        Some(e) => Err(doc.xml_error(e)),
-        None => Ok(scanned.ranges),
+pub fn index_records(doc: &Doc, selector: &str) -> Result<Vec<(usize, usize)>> {
+    index(doc, selector).map(|(r, _)| r)
+}
+
+/// Byte ranges of every record and the selector that found them (for JSON
+/// with an empty selector, the path that was picked automatically).
+pub fn index(doc: &Doc, selector: &str) -> Result<(Vec<(usize, usize)>, String)> {
+    let (ranges, error, used) = records(doc, selector)?;
+    if let Some(e) = error {
+        return Err(doc.xml_error(e));
     }
+    Ok((ranges, used))
 }
 
-pub fn parse_record<'d>(doc: &'d Doc, range: (usize, usize)) -> Result<xml::Obj<'d>> {
-    xml::parse_record(doc.bytes(), range, &doc.entities).map_err(|e| doc.xml_error(e))
+/// One record in the generic model, with the options applied.
+pub fn parse_node<'d>(doc: &'d Doc, range: (usize, usize), options: &Options) -> Result<Node<'d>> {
+    node_of(doc, range, options).map_err(|e| doc.xml_error(e))
 }
 
-pub fn record_json(doc: &Doc, range: (usize, usize), pretty: bool) -> Result<String> {
-    let obj = parse_record(doc, range)?;
+/// The JSON that converting this record writes.
+pub fn record_json(doc: &Doc, range: (usize, usize), pretty: bool, options: &Options) -> Result<String> {
     let mut out = Vec::new();
-    if pretty {
-        json::write_pretty(&mut out, &obj, 0);
+    if fast_path(doc, options) {
+        let obj = xml::parse_record(doc.bytes(), range, &doc.entities).map_err(|e| doc.xml_error(e))?;
+        if pretty { json::write_pretty(&mut out, &obj, 0) } else { json::write_compact(&mut out, &obj) }
     } else {
-        json::write_compact(&mut out, &obj);
+        let node = parse_node(doc, range, options)?;
+        if pretty { node::write_json_pretty(&mut out, &node, 0) } else { node::write_json_compact(&mut out, &node) }
     }
     Ok(String::from_utf8(out).expect("JSON output is UTF-8"))
 }
 
+/// Compact JSON of one record into `buf` (cleared first).
+fn compact_into(doc: &Doc, range: (usize, usize), options: &Options, fast: bool, buf: &mut Vec<u8>) -> XResult<()> {
+    buf.clear();
+    if fast {
+        json::write_compact(buf, &xml::parse_record(doc.bytes(), range, &doc.entities)?);
+    } else {
+        node::write_json_compact(buf, &node_of(doc, range, options)?);
+    }
+    Ok(())
+}
+
 /// Indices (into `ranges`) of records whose JSON contains `needle`.
 /// Case-insensitive unless the needle has an uppercase letter.
-pub fn search(doc: &Doc, ranges: &[(usize, usize)], needle: &str, progress: &Progress) -> Result<Vec<u32>> {
+pub fn search(doc: &Doc, ranges: &[(usize, usize)], needle: &str, options: &Options, progress: &Progress) -> Result<Vec<u32>> {
+    let fast = fast_path(doc, options);
     let case_sensitive = needle.chars().any(char::is_uppercase);
     // Look for the needle as it appears inside a JSON string, so quotes and
     // backslashes in the search text match their escaped form.
@@ -491,8 +805,8 @@ pub fn search(doc: &Doc, ranges: &[(usize, usize)], needle: &str, progress: &Pro
             }
             let mut buf = Vec::with_capacity(4096);
             for (i, &range) in chunk.iter().enumerate() {
-                let obj = match xml::parse_record(doc.bytes(), range, &doc.entities) {
-                    Ok(o) => o,
+                match compact_into(doc, range, options, fast, &mut buf) {
+                    Ok(()) => {}
                     Err(e) => {
                         let mut slot = error.lock().unwrap();
                         if slot.as_ref().is_none_or(|old| e.offset < old.offset) {
@@ -502,8 +816,6 @@ pub fn search(doc: &Doc, ranges: &[(usize, usize)], needle: &str, progress: &Pro
                         return found;
                     }
                 };
-                buf.clear();
-                json::write_compact(&mut buf, &obj);
                 let hit = if case_sensitive {
                     finder.find(&buf).is_some()
                 } else if ascii_needle {

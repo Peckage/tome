@@ -2,7 +2,7 @@
 
 A text viewer and converter built for heavy files.
 
-Tome opens files of hundreds of megabytes instantly, lets you scroll and search millions of records, and converts them to other formats. It is a single native binary (Rust, egui) with a window and a command line. It started life as `xml2json`, and that converter is still its core.
+Tome opens files of hundreds of megabytes instantly, lets you scroll and search millions of lines or records, and converts XML and JSON to JSON, NDJSON, YAML, XML, CSV and TSV. It is a single native binary (Rust, egui) with a window and a command line. It started life as `xml2json`, and that converter is still its core.
 
 On a 501 MB file with 2.6 million records (20-core i7-13650HX, file already in the page cache):
 
@@ -47,28 +47,67 @@ A 132 MB minified JSON file that is a single line scrolls just as smoothly, beca
 
 XML files also get the **Records** view below. Switch between the two with the tabs above the list.
 
-## Records view (XML)
+## Records view (XML and JSON)
 
 `bin/tome` (or `bin/tome any-file`, or drop a file on the window, or Ctrl+O).
 
-- **Opening** a file maps it into memory without loading or rendering it. The app shows the size and line count and suggests the record tag (the first repeating element). A tag you typed yourself is kept.
+XML and JSON files also get a Records view, which is where converting happens.
+
+- **Opening** a file maps it into memory without loading or rendering it.
+  - **XML:** the app suggests the record tag (the first repeating element). A tag you typed yourself is kept.
+  - **JSON:** *Records at* picks the records automatically: the items of the root array, or of the biggest array under the root object. You can also type a key path such as `data.items`, `$` (the whole file is one record) or `lines` (one value per line).
+  - **NDJSON and JSON Lines:** `.ndjson`/`.jsonl` files, and any file with several top-level values, give one record per value.
 - **Records** are listed one per row. Click a record to expand it into a tree with one `key: value` per line, and click any branch to fold it. The tree hides the always-a-list wrapper to make it easier to read. The panel on the right shows the exact JSON the conversion writes for the selected record, with a Copy button.
 - **Scrolling** works with the wheel, PageUp/PageDown, Home/End or the scrollbar, smoothly across millions of records. Only visible records are parsed.
 - **Search** looks through every record's JSON in parallel. It ignores case unless the search text has capitals. **Go to #** jumps to a record number.
-- **Convert** writes Pretty JSON, Compact JSON or NDJSON, with progress and Cancel. It asks before replacing a file. If you cancel, hit an error or close the window, the previous output stays untouched.
+- **Convert** writes any of the formats below, with progress and Cancel. It asks before replacing a file. If you cancel, hit an error or close the window, the previous output stays untouched.
+
+### Output formats
+
+| Format | What you get |
+|---|---|
+| Pretty JSON | An indented array, exactly like `json.dumps(records, indent=2)` |
+| Compact JSON | An array with one compact record per line |
+| NDJSON | One compact record per line, no array |
+| YAML | A sequence with one item per record. Strings are always double-quoted, so `"00123"`, `"yes"` and `"null"` stay strings in every YAML reader. |
+| XML | `<records>` with one element per record. For XML input, strings become attributes and lists become repeated child elements, so XML → XML round-trips. For JSON input, values become child elements. Keys that aren't valid XML names are fixed (`1 bad` → `_1_bad`). |
+| CSV / TSV | One row per record. Nested keys become dotted columns (`price.cur`). `#text` adds nothing to the column name, so `name: [{"#text": "Bolt"}]` is the column `name`. A column with several values (a list) holds them joined with `; `. The columns are every key seen in any record, in order of first appearance. |
+
+Converting JSON to JSON is also a fast formatter: pretty-print a one-line 100 MB file, or minify an indented one. Numbers keep their exact text, and key order and duplicate keys are preserved.
+
+### Clean-up and shape options
+
+They are all off by default, which gives the plain mapping below. They apply to the converted file, the JSON panel, the tree and search.
+
+- **Trim** removes spaces at the start and end of every value.
+- **Collapse spaces** turns every run of spaces, tabs and newlines into one space.
+- **Remove empty** drops empty strings, nulls, `{}` and `[]` everywhere, bottom-up. A record that becomes empty stays `{}`, so the record count never changes.
+- **Unwrap 1-item lists** turns `[x]` into `x`.
+- **Text as value** turns `{"#text": "Bolt"}` into `"Bolt"`.
+- **Attr. prefix** (XML) puts a prefix in front of attribute names, for example `@id`.
+- **Drop fields** removes keys by name wherever they occur. Use the names as they appear in the output, so `@id` when you use a prefix.
+- **Simple** sets the last three the way xmltodict does: `@` attributes, plain text values, no one-item lists.
 
 ## Command line
 
 ```sh
-tome parts.xml parts.json               # JSON array, one compact record per line
-tome parts.xml parts.json --pretty      # indented like json.dumps(..., indent=2)
-tome parts.xml parts.ndjson --ndjson    # one object per line
-tome parts.xml parts.json --tag item    # another record element (default: part)
+tome parts.xml parts.json                   # JSON array, one compact record per line
+tome parts.xml parts.json --pretty          # indented like json.dumps(..., indent=2)
+tome parts.xml parts.ndjson                 # one object per line (format from the extension)
+tome parts.xml parts.csv                    # also .tsv .yaml .yml .xml .jsonl
+tome parts.xml parts.json --tag item        # another record element (default: part)
+tome data.json data.csv --records data.items
+tome big.json pretty.json --pretty          # reformat JSON
+tome parts.xml clean.json --simple --trim --remove-empty --drop internal_id
+tome --help                                 # every option
 ```
 
-The exit code is 0 on success and 1 on an error (the message includes line and column).
+The output format follows the output file's extension. `.json` gives compact JSON unless you pass `--pretty`, and `--format NAME` overrides the extension. The exit code is 0 on success and 1 on an error (the message includes line and column).
 
-## Mapping
+## Mapping (XML to JSON)
+
+This is the plain mapping. With every option off, the compact output is byte-for-byte identical to the original Python version.
+
 
 - Attributes become string keys and are never converted to numbers, so `"00123"` stays `"00123"`.
 - Child elements always become arrays, even when there is only one.
@@ -97,6 +136,15 @@ cargo test --release                                 # window logic, run headles
 TOME_BIG=big.xml cargo test --release -- --ignored --nocapture   # timings on a big file
 ```
 
-`tests/compare_with_python.py` runs about 50 hand-written edge cases, including malformed files, plus random documents. Each one goes through the Python reference in `python/` and through the Rust binary in all three formats. It also checks that the parallel scanner agrees with the sequential one at chunk sizes down to 1 byte.
+`tests/compare_with_python.py` runs about 50 hand-written edge cases, including malformed files, plus random documents. Each one goes through the Python reference in `python/` and through the Rust binary in all three JSON formats. It also checks that the parallel scanner agrees with the sequential one at chunk sizes down to 1 byte.
+
+For each case that converts, it also checks:
+
+- The generic writers give the same bytes as the fast path.
+- Feeding the JSON and NDJSON output back in as input gives exactly the same output again.
+- The YAML loads (with PyYAML) as the same records.
+- The XML output converts back to the same JSON.
+- CSV and TSV match a Python model of the flattening.
+- Four combinations of clean-up options match a Python model of them.
 
 `python/` holds the original Python/GTK version. It is kept as the reference implementation for these tests.

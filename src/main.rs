@@ -2,6 +2,8 @@ mod cli;
 mod engine;
 mod gui;
 mod json;
+mod jsonin;
+mod node;
 mod pscan;
 mod text;
 mod xml;
