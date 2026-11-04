@@ -24,11 +24,32 @@ The compact output is byte-for-byte identical to the Python version's.
 ./install.sh --remove   # removes the menu entry
 ```
 
-The menu entry also shows up under "Open with" for XML and JSON files (it is not made the default app). Outside this folder the script writes only `~/.local/share/applications/io.github.peckage.Tome.desktop` (and removes the old `io.github.xml2json.Converter.desktop`), and it refreshes `mimeinfo.cache` in that folder.
+The menu entry also shows up under "Open with" for text, XML and JSON files (it is not made the default app). Outside this folder the script writes only `~/.local/share/applications/io.github.peckage.Tome.desktop` (and removes the old `io.github.xml2json.Converter.desktop`), and it refreshes `mimeinfo.cache` in that folder.
 
-## Window
+## Text view
 
-`bin/tome` (or `bin/tome file.xml`, or drop a file on the window).
+Any file opens in the text view: logs, CSV, minified JSON, source code, anything. The file is memory-mapped and its line starts are found on all cores, so nothing is loaded or rendered up front.
+
+| 448 MB log, 5 million lines | Time |
+|---|---|
+| Open and index every line | 0.04 s |
+| Find a word (all matches) | 0.02 s |
+| Find with a regular expression | 0.02 s |
+
+A 132 MB minified JSON file that is a single line scrolls just as smoothly, because only the part of each line that fits on screen is decoded.
+
+- **Scroll** with the wheel (Shift+wheel or ←/→ scrolls sideways), PageUp/PageDown, Home/End or the scrollbar.
+- **Select** lines by clicking, Shift+clicking or dragging, or with ↑/↓ (Shift extends). Ctrl+A selects everything.
+- **Copy** with Ctrl+C or the right-click menu. Copies are capped at 64 MB.
+- **Find** (Ctrl+F) highlights every match. Enter or F3 goes to the next one, Shift+F3 to the previous one. The search ignores case unless you type a capital. Turn on `.*` for regular expressions.
+- **Go to line** with Ctrl+G.
+- The toolbar shows the encoding guess (UTF-8, UTF-16, 8-bit or binary) and the line endings (LF or CRLF).
+
+XML files also get the **Records** view below. Switch between the two with the tabs above the list.
+
+## Records view (XML)
+
+`bin/tome` (or `bin/tome any-file`, or drop a file on the window, or Ctrl+O).
 
 - **Opening** a file maps it into memory without loading or rendering it. The app shows the size and line count and suggests the record tag (the first repeating element). A tag you typed yourself is kept.
 - **Records** are listed one per row. Click a record to expand it into a tree with one `key: value` per line, and click any branch to fold it. The tree hides the always-a-list wrapper to make it easier to read. The panel on the right shows the exact JSON the conversion writes for the selected record, with a Copy button.

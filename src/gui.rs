@@ -17,7 +17,11 @@ use eframe::egui::{self, Align2, Color32, FontId, Key, Rect, RichText, Sense, St
 
 use crate::cli::group;
 use crate::engine::{self, Doc, Error, Format, Progress};
+use crate::text::TextFile;
 use crate::xml::{Obj, Value};
+
+mod textview;
+use textview::TextView;
 
 pub const APP_ID: &str = "io.github.peckage.Tome";
 const ROW_HEIGHT: f32 = 20.0;
@@ -98,9 +102,34 @@ impl<T: Send + 'static> Job<T> {
 struct Opened {
     path: PathBuf,
     doc: engine::Result<Arc<Doc>>,
-    lines: Option<u64>,
     guessed_tag: Option<String>,
     seconds: f64,
+}
+
+struct TextOpened {
+    path: PathBuf,
+    text: engine::Result<Arc<TextFile>>,
+    seconds: f64,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum View {
+    Text,
+    Records,
+}
+
+/// Does this file look like XML? Checks the first non-blank character after
+/// any byte order mark, so the record view is only offered when it can work.
+fn looks_like_xml(path: &Path) -> bool {
+    use std::io::Read;
+    let mut head = [0u8; 512];
+    let n = std::fs::File::open(path).and_then(|mut f| f.read(&mut head)).unwrap_or(0);
+    let head = &head[..n];
+    if head.starts_with(b"\xFF\xFE<") || head.starts_with(b"\xFE\xFF\0<") || head.starts_with(b"<\0") || head.starts_with(b"\0<") {
+        return true;
+    }
+    let head = head.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(head);
+    head.iter().find(|b| !b.is_ascii_whitespace()) == Some(&b'<')
 }
 
 struct Indexed {
@@ -272,6 +301,15 @@ pub struct App {
     doc: Option<Arc<Doc>>,
     lines: Option<u64>,
     open_job: Option<Job<Opened>>,
+    /// True when the file is XML, so the record view and converter apply.
+    is_xml: bool,
+
+    text: Option<Arc<TextFile>>,
+    text_job: Option<Job<TextOpened>>,
+    textview: TextView,
+    view: View,
+    /// The user picked a view for this file; don't switch automatically.
+    view_chosen: bool,
 
     tag: String,
     /// The tag we last filled in automatically; anything else was typed.
@@ -317,6 +355,12 @@ impl Default for App {
             doc: None,
             lines: None,
             open_job: None,
+            is_xml: false,
+            text: None,
+            text_job: None,
+            textview: TextView::default(),
+            view: View::Text,
+            view_chosen: false,
             tag: "part".into(),
             auto_tag: "part".into(),
             tag_edited_at: None,
@@ -339,7 +383,7 @@ impl Default for App {
             confirm_overwrite: false,
             convert_job: None,
             dialog: None,
-            status: Status { text: "Open an XML file, or drop one on this window.".into(), error: false },
+            status: Status { text: "Open a file (Ctrl+O), or drop one on this window.".into(), error: false },
         }
     }
 }
@@ -370,16 +414,29 @@ impl App {
         self.ranges = None;
         self.indexed_tag.clear();
         self.index_job = None;
+        self.open_job = None;
+        self.text = None;
+        self.textview.reset();
+        self.view_chosen = false;
         self.path = Some(path.clone());
+        self.is_xml = looks_like_xml(&path);
+        self.view = View::Text;
         self.output = default_output(&path, self.format);
         self.set_status(format!("Opening {}…", path.display()), false);
-        self.open_job = Some(Job::spawn(ctx, move |_| {
+        let text_path = path.clone();
+        self.text_job = Some(Job::spawn(ctx, move |_| {
             let started = Instant::now();
-            let lines = engine::count_lines(&path).ok();
-            let doc = Doc::open(&path).map(Arc::new);
-            let guessed_tag = doc.as_ref().ok().and_then(|d| d.guess_record_tag());
-            Opened { path, doc, lines, guessed_tag, seconds: started.elapsed().as_secs_f64() }
+            let text = TextFile::open(&text_path).map(Arc::new);
+            TextOpened { path: text_path, text, seconds: started.elapsed().as_secs_f64() }
         }));
+        if self.is_xml {
+            self.open_job = Some(Job::spawn(ctx, move |_| {
+                let started = Instant::now();
+                let doc = Doc::open(&path).map(Arc::new);
+                let guessed_tag = doc.as_ref().ok().and_then(|d| d.guess_record_tag());
+                Opened { path, doc, guessed_tag, seconds: started.elapsed().as_secs_f64() }
+            }));
+        }
     }
 
     fn reset_view(&mut self) {
@@ -579,10 +636,28 @@ impl App {
     // -----------------------------------------------------------------------
 
     fn poll_jobs(&mut self, ctx: &egui::Context) {
+        if let Some(done) = self.text_job.as_ref().and_then(Job::poll) {
+            self.text_job = None;
+            if Some(&done.path) == self.path.as_ref() {
+                match done.text {
+                    Ok(text) => {
+                        self.lines = Some(text.line_count() as u64);
+                        if !self.is_xml {
+                            self.set_status(
+                                format!("Opened {} lines in {:.2} s.", group(text.line_count() as u64), done.seconds),
+                                false,
+                            );
+                        }
+                        self.text = Some(text);
+                    }
+                    Err(e) => self.set_status(format!("Cannot read this file: {e}"), true),
+                }
+            }
+        }
+
         if let Some(done) = self.open_job.as_ref().and_then(Job::poll) {
             self.open_job = None;
             if Some(&done.path) == self.path.as_ref() {
-                self.lines = done.lines;
                 match done.doc {
                     Ok(doc) => {
                         let note = doc.transcoded_from.as_ref().map(|e| format!(" (converted from {e})")).unwrap_or_default();
@@ -597,7 +672,7 @@ impl App {
                         self.set_status(format!("Opened in {:.2} s{note}.", done.seconds), false);
                         self.start_index(ctx);
                     }
-                    Err(e) => self.set_status(format!("Cannot read this file: {e}"), true),
+                    Err(e) => self.set_status(format!("Not readable as XML: {e}. The text view still works."), true),
                 }
             }
         }
@@ -620,6 +695,9 @@ impl App {
                     Ok(r) => {
                         let n = r.len();
                         self.ranges = Some(Arc::new(r));
+                        if !self.view_chosen {
+                            self.view = View::Records;
+                        }
                         self.set_status(
                             format!("Indexed {} <{}> records in {:.2} s.", group(n as u64), done.tag, done.seconds),
                             false,
@@ -695,7 +773,15 @@ impl App {
             }
         }
 
-        let busy = self.open_job.is_some() || self.index_job.is_some() || self.search_job.is_some() || self.convert_job.is_some();
+        if let Some((text, error)) = self.textview.status.take() {
+            self.set_status(text, error);
+        }
+        let busy = self.open_job.is_some()
+            || self.text_job.is_some()
+            || self.index_job.is_some()
+            || self.search_job.is_some()
+            || self.convert_job.is_some()
+            || self.textview.busy();
         if busy {
             ctx.request_repaint_after(Duration::from_millis(50));
         }
@@ -706,7 +792,7 @@ impl App {
         let ctx = ctx.clone();
         let dir = self.path.as_ref().and_then(|p| p.parent().map(Path::to_path_buf));
         std::thread::spawn(move || {
-            let mut dialog = rfd::FileDialog::new().set_title("Open XML file").add_filter("XML", &["xml", "XML"]).add_filter("All files", &["*"]);
+            let mut dialog = rfd::FileDialog::new().set_title("Open file").add_filter("All files", &["*"]).add_filter("XML", &["xml", "XML"]);
             if let Some(dir) = dir {
                 dialog = dialog.set_directory(dir);
             }
@@ -749,11 +835,17 @@ impl App {
             self.open(path, &ctx);
         }
 
+        if ui.input(|i| i.modifiers.command && i.key_pressed(Key::O)) && self.dialog.is_none() {
+            self.open_dialog(&ctx);
+        }
+
         egui::Panel::top("file").show(ui, |ui| {
             ui.add_space(6.0);
             self.file_bar(ui);
-            ui.add_space(2.0);
-            self.convert_bar(ui);
+            if self.is_xml {
+                ui.add_space(2.0);
+                self.convert_bar(ui);
+            }
             ui.add_space(6.0);
         });
         egui::Panel::bottom("status").show(ui, |ui| {
@@ -762,17 +854,51 @@ impl App {
             ui.label(RichText::new(&self.status.text).color(color));
             ui.add_space(3.0);
         });
-        if self.selected.is_some() {
+        if self.selected.is_some() && self.view == View::Records {
             egui::Panel::right("json").resizable(true).default_size(420.0).min_size(240.0).show(ui, |ui| self.json_panel(ui));
         }
-        egui::CentralPanel::default().show(ui, |ui| self.records_panel(ui));
+        egui::CentralPanel::default().show(ui, |ui| {
+            if self.path.is_some() {
+                ui.horizontal(|ui| {
+                    if ui.selectable_label(self.view == View::Text, "Text").on_hover_text("Every line of the file").clicked() {
+                        self.view = View::Text;
+                        self.view_chosen = true;
+                    }
+                    if self.is_xml
+                        && ui
+                            .selectable_label(self.view == View::Records, "Records")
+                            .on_hover_text("One row per XML record, with the JSON it converts to")
+                            .clicked()
+                    {
+                        self.view = View::Records;
+                        self.view_chosen = true;
+                    }
+                });
+                ui.add_space(2.0);
+            }
+            match self.view {
+                View::Records => self.records_panel(ui),
+                View::Text => match self.text.clone() {
+                    Some(text) => self.textview.draw(ui, &text),
+                    None => {
+                        ui.centered_and_justified(|ui| {
+                            let msg = if self.text_job.is_some() { "Reading…" } else { "Open a file, or drop one on this window. Any size, any text." };
+                            ui.label(RichText::new(msg).weak().size(16.0));
+                        });
+                    }
+                },
+            }
+        });
+        if let Some((text, error)) = self.textview.status.take() {
+            self.set_status(text, error);
+        }
     }
 
     fn file_bar(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         ui.horizontal(|ui| {
             let busy_dialog = self.dialog.is_some();
-            if ui.add_enabled(!busy_dialog, egui::Button::new("📂 Open…")).clicked() {
+            if ui.add_enabled(!busy_dialog, egui::Button::new("📂 Open…")).on_hover_text("Open any file (Ctrl+O)").clicked() {
                 self.open_dialog(&ctx);
             }
             match &self.path {
@@ -784,13 +910,13 @@ impl App {
                     }
                     match self.lines {
                         Some(n) => info.push(format!("{} lines", group(n))),
-                        None if self.open_job.is_some() => info.push("counting lines…".into()),
+                        None if self.text_job.is_some() => info.push("counting lines…".into()),
                         None => {}
                     }
                     if let Some(r) = &self.ranges {
                         info.push(format!("{} records", group(r.len() as u64)));
-                    } else if self.index_job.is_some() {
-                        info.push("indexing…".into());
+                    } else if self.index_job.is_some() || self.open_job.is_some() {
+                        info.push("indexing records…".into());
                     }
                     ui.label(RichText::new(info.join("  ·  ")).weak());
                 }
@@ -1065,24 +1191,10 @@ impl App {
             }
         }
 
-        // Scrollbar.
-        let bar_response = ui.interact(bar, ui.scope_id().with("scrollbar"), Sense::click_and_drag());
-        let painter = ui.painter();
-        painter.rect_filled(bar, 6.0, visuals.extreme_bg_color);
-        if total > visible {
-            let thumb_h = (bar.height() * visible as f32 / total as f32).max(24.0);
-            let travel = bar.height() - thumb_h;
-            let t = self.top as f32 / max_top.max(1) as f32;
-            let thumb = Rect::from_min_size(egui::pos2(bar.min.x, bar.min.y + t * travel), Vec2::new(bar.width(), thumb_h));
-            let color = if bar_response.dragged() || bar_response.hovered() { visuals.widgets.active.bg_fill } else { visuals.widgets.inactive.bg_fill };
-            painter.rect_filled(thumb.shrink(2.0), 5.0, color);
-            if let Some(p) = bar_response.interact_pointer_pos() {
-                if bar_response.dragged() || bar_response.clicked() {
-                    let t = ((p.y - bar.min.y - thumb_h / 2.0) / travel.max(1.0)).clamp(0.0, 1.0);
-                    self.top = (t * max_top as f32).round() as usize;
-                }
-            }
+        if let Some(top) = scrollbar(ui, bar, self.top, total, visible, ui.scope_id().with("scrollbar")) {
+            self.top = top;
         }
+        let painter = ui.painter();
         painter.rect_stroke(list, 4.0, Stroke::new(1.0, visuals.widgets.noninteractive.bg_stroke.color), egui::StrokeKind::Outside);
         ui.allocate_rect(area, Sense::hover());
     }
@@ -1113,6 +1225,31 @@ impl App {
             });
         }
     }
+}
+
+/// A vertical scrollbar for a list of `total` rows showing `visible` from
+/// `top`. Returns a new `top` when the user dragged or clicked it.
+fn scrollbar(ui: &mut egui::Ui, bar: Rect, top: usize, total: usize, visible: usize, id: egui::Id) -> Option<usize> {
+    let response = ui.interact(bar, id, Sense::click_and_drag());
+    let visuals = ui.visuals().clone();
+    let painter = ui.painter();
+    painter.rect_filled(bar, 6.0, visuals.extreme_bg_color);
+    if total <= visible {
+        return None;
+    }
+    let max_top = total - visible;
+    let thumb_h = (bar.height() * visible as f32 / total as f32).max(24.0);
+    let travel = bar.height() - thumb_h;
+    let t = top as f32 / max_top.max(1) as f32;
+    let thumb = Rect::from_min_size(egui::pos2(bar.min.x, bar.min.y + t * travel), Vec2::new(bar.width(), thumb_h));
+    let color = if response.dragged() || response.hovered() { visuals.widgets.active.bg_fill } else { visuals.widgets.inactive.bg_fill };
+    painter.rect_filled(thumb.shrink(2.0), 5.0, color);
+    let p = response.interact_pointer_pos()?;
+    if response.dragged() || response.clicked() {
+        let t = ((p.y - bar.min.y - thumb_h / 2.0) / travel.max(1.0)).clamp(0.0, 1.0);
+        return Some((t * max_top as f32).round() as usize);
+    }
+    None
 }
 
 fn format_name(f: Format) -> &'static str {
@@ -1193,7 +1330,7 @@ mod tests {
         let mut app = App::default();
         app.tag = "wrong".into(); // typed by the user: must not be replaced
         app.open(path.clone(), &ctx);
-        wait(&ctx, &mut app, |a| a.open_job.is_none() && a.index_job.is_none());
+        wait(&ctx, &mut app, |a| a.open_job.is_none() && a.index_job.is_none() && a.text_job.is_none());
         assert_eq!(app.lines, Some(5003));
         assert_eq!(app.tag, "wrong");
         assert_eq!(app.ranges.as_ref().unwrap().len(), 0);
@@ -1285,6 +1422,82 @@ mod tests {
         assert!(app.status.text.contains("mismatched tag: line 2"), "{}", app.status.text);
         frame(&ctx, &mut app, vec![]);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn plain_text_file() {
+        let dir = temp_dir("text");
+        let path = dir.join("notes.log");
+        let mut content = String::new();
+        for i in 0..50_000 {
+            content.push_str(&format!("{i}\tline with\ttabs and a word{}\r\n", if i % 1000 == 7 { " NEEDLE" } else { "" }));
+        }
+        std::fs::write(&path, content).unwrap();
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.open(path, &ctx);
+        wait(&ctx, &mut app, |a| a.text_job.is_none());
+        assert!(!app.is_xml);
+        assert!(app.open_job.is_none(), "no XML parsing for a text file");
+        assert_eq!(app.view, View::Text);
+        assert_eq!(app.lines, Some(50_000));
+        let text = app.text.clone().unwrap();
+        assert!(text.crlf);
+        frame(&ctx, &mut app, vec![]);
+
+        // Search jumps to the first match and selects its line.
+        app.textview.search = "needle".into();
+        app.textview.start_search(&ctx, &text);
+        wait(&ctx, &mut app, |a| !a.textview.busy());
+        frame(&ctx, &mut app, vec![]);
+        assert_eq!(app.textview.matches.as_ref().unwrap().len(), 50);
+        assert_eq!(app.textview.selection, Some((7, 7)));
+        assert!(app.status.text.starts_with("50 matches"), "{}", app.status.text);
+
+        // Ctrl+C copies the selected line, without the CRLF.
+        let _ = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(1200.0, 800.0))),
+                events: vec![egui::Event::Copy],
+                ..Default::default()
+            },
+            |ui| app.draw(ui),
+        );
+        assert_eq!(app.status.text, "Copied line 8.");
+
+        // End scrolls to the last page; nothing panics past the end.
+        frame(&ctx, &mut app, vec![egui::Event::Key { key: Key::End, physical_key: None, pressed: true, repeat: false, modifiers: Default::default() }]);
+        assert_eq!(app.textview.selection, Some((49_999, 49_999)));
+        for _ in 0..3 {
+            frame(&ctx, &mut app, vec![egui::Event::Key { key: Key::PageDown, physical_key: None, pressed: true, repeat: false, modifiers: Default::default() }]);
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Run with: TOME_BIG_TEXT=/path/file cargo test --release big_text -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn big_text_frames() {
+        let Ok(path) = std::env::var("TOME_BIG_TEXT") else { return };
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        let t = Instant::now();
+        app.open(PathBuf::from(path), &ctx);
+        wait(&ctx, &mut app, |a| a.text_job.is_none());
+        println!("open + index lines: {:.3}s  lines={:?}", t.elapsed().as_secs_f64(), app.lines);
+        app.view = View::Text;
+        let t = Instant::now();
+        for _ in 0..20 { frame(&ctx, &mut app, vec![]); }
+        println!("draw frame: {:.2} ms", t.elapsed().as_secs_f64() * 1000.0 / 20.0);
+        let text = app.text.clone().unwrap();
+        app.textview.search = "1".into();
+        let t = Instant::now();
+        app.textview.start_search(&ctx, &text);
+        wait(&ctx, &mut app, |a| !a.textview.busy());
+        println!("search \"1\": {:.3}s  matches={}", t.elapsed().as_secs_f64(), app.textview.matches.as_ref().unwrap().len());
+        let t = Instant::now();
+        for _ in 0..20 { frame(&ctx, &mut app, vec![]); }
+        println!("draw frame with highlights: {:.2} ms", t.elapsed().as_secs_f64() * 1000.0 / 20.0);
     }
 
     /// Run with: TOME_BIG=/path/big.xml cargo test --release -- --ignored --nocapture

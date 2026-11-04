@@ -3,6 +3,7 @@ mod engine;
 mod gui;
 mod json;
 mod pscan;
+mod text;
 mod xml;
 
 fn main() {
@@ -23,6 +24,19 @@ fn main() {
         let mut n = 0;
         while let Some(_) = scanner.next_record().unwrap() { n += 1; }
         eprintln!("serial scan   {:.3}s ({n} records)", t.elapsed().as_secs_f64());
+        std::process::exit(0);
+    }
+    if argv.get(1).map(String::as_str) == Some("--bench-text") {
+        // Hidden: time opening argv[2] as text and searching it for argv[3].
+        let t = std::time::Instant::now();
+        let file = text::TextFile::open(std::path::Path::new(&argv[2])).unwrap();
+        eprintln!("open+index    {:.3}s ({} lines, longest {} bytes)", t.elapsed().as_secs_f64(), file.line_count(), file.longest_line);
+        for regex in [false, true] {
+            let t = std::time::Instant::now();
+            let p = text::Pattern::new(&argv[3], regex).unwrap();
+            let (hits, _) = text::find_all(&file, &p, 10_000_000, &engine::Progress::default()).unwrap();
+            eprintln!("search{}  {:.3}s ({} hits)", if regex { " (re)" } else { "     " }, t.elapsed().as_secs_f64(), hits.len());
+        }
         std::process::exit(0);
     }
     if argv.get(1).map(String::as_str) == Some("--check-scan") {

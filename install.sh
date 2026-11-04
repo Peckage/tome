@@ -33,14 +33,14 @@ cat > "$entry" <<EOF
 [Desktop Entry]
 Type=Application
 Name=Tome
-GenericName=Structured Text Viewer
-Comment=View, search and convert huge XML and JSON files
+GenericName=Text Viewer
+Comment=Open, search and convert huge text files
 Exec="$repo/bin/tome" %f
 Icon=$repo/data/tome.svg
 Terminal=false
 Categories=Utility;TextTools;
-MimeType=application/xml;text/xml;application/json;application/x-ndjson;
-Keywords=xml;json;ndjson;csv;yaml;convert;viewer;
+MimeType=text/plain;text/x-log;text/csv;application/xml;text/xml;application/json;application/x-ndjson;
+Keywords=text;editor;viewer;log;large;xml;json;csv;convert;
 StartupWMClass=io.github.peckage.Tome
 EOF
 
