@@ -43,6 +43,8 @@ Other:
     --quiet             no progress output
     -h, --help          show this help";
 
+static VIA_PREVIEW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 pub struct Args {
     pub input: PathBuf,
     pub output: PathBuf,
@@ -127,6 +129,11 @@ pub fn parse(argv: Vec<String>) -> Command {
                 options.attr_prefix = s.attr_prefix;
                 Ok(())
             }
+            "--via-preview" => {
+                // Hidden test hook: write through the live-preview renderer.
+                VIA_PREVIEW.store(true, std::sync::atomic::Ordering::Relaxed);
+                Ok(())
+            }
             "--generic" => {
                 // Hidden test hook: force the generic writer path.
                 crate::engine::FORCE_GENERIC.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -200,7 +207,11 @@ pub fn run(args: Args) -> i32 {
                 eprint!("\r\x1b[K");
             })
         });
-        let result = engine::convert(&doc, &selector, &args.output, args.format, &args.options, &progress);
+        let result = if VIA_PREVIEW.load(std::sync::atomic::Ordering::Relaxed) {
+            engine::write_via_preview(&doc, &selector, &args.output, args.format, &args.options)
+        } else {
+            engine::convert(&doc, &selector, &args.output, args.format, &args.options, &progress)
+        };
         done.store(true, Ordering::Relaxed);
         if let Some(handle) = reporter {
             let _ = handle.join();

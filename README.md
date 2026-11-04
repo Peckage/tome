@@ -51,16 +51,21 @@ XML files also get the **Records** view below. Switch between the two with the t
 
 `bin/tome` (or `bin/tome any-file`, or drop a file on the window, or Ctrl+O).
 
-XML and JSON files also get a Records view, which is where converting happens.
+XML and JSON files also get two more views.
+
+- **Records** lists one record per row, with a tree to expand.
+- **As <format>** (the live preview) shows the whole file in the format picked in the top bar (Pretty JSON, YAML, XML, CSV and so on) without converting anything. Only what is on screen is rendered, so switching formats on a 229 MB file with 1.3 million records takes under 10 ms. CSV and TSV take about 0.2 s, because the column list needs every record. Scroll with the wheel, the keys or the scrollbar. Click a record to select it, and Ctrl+C copies it in that format.
+
+The panel on the right shows the selected record in the selected format. **💾 Save** writes the whole file exactly as the preview shows it, which a test checks byte for byte for every format.
 
 - **Opening** a file maps it into memory without loading or rendering it.
   - **XML:** the app suggests the record tag (the first repeating element). A tag you typed yourself is kept.
   - **JSON:** *Records at* picks the records automatically: the items of the root array, or of the biggest array under the root object. You can also type a key path such as `data.items`, `$` (the whole file is one record) or `lines` (one value per line).
   - **NDJSON and JSON Lines:** `.ndjson`/`.jsonl` files, and any file with several top-level values, give one record per value.
-- **Records** are listed one per row. Click a record to expand it into a tree with one `key: value` per line, and click any branch to fold it. The tree hides the always-a-list wrapper to make it easier to read. The panel on the right shows the exact JSON the conversion writes for the selected record, with a Copy button.
+- **Records** are listed one per row. Click a record to expand it into a tree with one `key: value` per line, and click any branch to fold it. The tree hides the always-a-list wrapper to make it easier to read. The panel on the right shows the record exactly as Save writes it, in the selected format, with a Copy button.
 - **Scrolling** works with the wheel, PageUp/PageDown, Home/End or the scrollbar, smoothly across millions of records. Only visible records are parsed.
 - **Search** looks through every record's JSON in parallel. It ignores case unless the search text has capitals. **Go to #** jumps to a record number.
-- **Convert** writes any of the formats below, with progress and Cancel. It asks before replacing a file. If you cancel, hit an error or close the window, the previous output stays untouched.
+- **Save** writes any of the formats below, with progress and Cancel. It asks before replacing a file. If you cancel, hit an error or close the window, the previous output stays untouched.
 
 ### Output formats
 
@@ -141,6 +146,7 @@ TOME_BIG=big.xml cargo test --release -- --ignored --nocapture   # timings on a 
 For each case that converts, it also checks:
 
 - The generic writers give the same bytes as the fast path.
+- Joining the live preview's blocks gives the saved file exactly, in all seven formats.
 - Feeding the JSON and NDJSON output back in as input gives exactly the same output again.
 - The YAML loads (with PyYAML) as the same records.
 - The XML output converts back to the same JSON.

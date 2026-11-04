@@ -16,11 +16,13 @@ use std::time::{Duration, Instant};
 use eframe::egui::{self, Align2, Color32, FontId, Key, Rect, RichText, Sense, Stroke, Vec2};
 
 use crate::cli::group;
-use crate::engine::{self, Doc, Error, Format, Kind, Progress};
+use crate::engine::{self, Doc, Encoder, Error, Format, Kind, Progress};
 use crate::node::{Node, Options};
 use crate::text::TextFile;
 
+mod preview;
 mod textview;
+use preview::PreviewView;
 use textview::TextView;
 
 pub const APP_ID: &str = "io.github.peckage.Tome";
@@ -116,6 +118,23 @@ struct TextOpened {
 enum View {
     Text,
     Records,
+    /// The whole file in the selected output format.
+    Preview,
+}
+
+/// What an [`Encoder`] was built for; a change means rebuilding it.
+#[derive(Clone, PartialEq)]
+struct EncoderKey {
+    doc: usize,
+    tag: String,
+    records: usize,
+    format: Format,
+    options: Options,
+}
+
+struct ColumnsDone {
+    key: EncoderKey,
+    columns: engine::Result<Vec<String>>,
 }
 
 struct Indexed {
@@ -351,7 +370,14 @@ pub struct App {
     scroll_remainder: f32,
     expanded: BTreeMap<u32, Expanded>,
     selected: Option<u32>,
+    /// The selected record rendered in the selected format.
     selected_json: Option<(u32, String)>,
+    preview: PreviewView,
+    encoder: Option<Arc<Encoder>>,
+    encoder_key: Option<EncoderKey>,
+    columns_job: Option<Job<ColumnsDone>>,
+    /// The settings the running columns job is for.
+    columns_for: Option<EncoderKey>,
     summaries: HashMap<u32, String>,
 
     format: Format,
@@ -399,6 +425,11 @@ impl Default for App {
             expanded: BTreeMap::new(),
             selected: None,
             selected_json: None,
+            preview: PreviewView::default(),
+            encoder: None,
+            encoder_key: None,
+            columns_job: None,
+            columns_for: None,
             summaries: HashMap::new(),
             format: Format::Pretty,
             output: String::new(),
@@ -439,6 +470,7 @@ impl App {
         self.open_job = None;
         self.text = None;
         self.textview.reset();
+        self.preview.reset();
         self.view_chosen = false;
         self.path = Some(path.clone());
         let kind = engine::sniff_kind(&path);
@@ -619,6 +651,8 @@ impl App {
 
     /// The clean-up options changed: everything shown per record is stale.
     fn options_changed(&mut self, ctx: &egui::Context) {
+        self.ensure_encoder(ctx);
+        ctx.request_repaint();
         self.summaries.clear();
         let open: Vec<u32> = self.expanded.keys().copied().collect();
         self.expanded.clear();
@@ -664,9 +698,81 @@ impl App {
         }
         let (Some(doc), Some(ranges)) = (&self.doc, &self.ranges) else { return };
         if let Some(&range) = ranges.get(record as usize) {
-            let json = engine::record_json(doc, range, true, &self.options).unwrap_or_else(|e| format!("error: {e}"));
-            self.selected_json = Some((record, json));
+            let text = match &self.encoder {
+                Some(encoder) => encoder.render_one(doc, range),
+                None if self.format.is_table() => Ok("Finding the columns…".into()),
+                None => engine::record_json(doc, range, true, &self.options),
+            };
+            self.selected_json = Some((record, text.unwrap_or_else(|e| format!("error: {e}"))));
         }
+    }
+
+    fn refresh_selected(&mut self) {
+        if let Some(record) = self.selected {
+            self.selected_json = None;
+            self.select(record);
+        }
+    }
+
+    /// Keep the encoder for the selected format up to date. CSV and TSV need
+    /// every record's columns first, which is found in the background.
+    fn ensure_encoder(&mut self, ctx: &egui::Context) {
+        let (Some(doc), Some(ranges)) = (self.doc.clone(), self.ranges.clone()) else {
+            self.encoder = None;
+            self.encoder_key = None;
+            return;
+        };
+        let key = EncoderKey {
+            doc: Arc::as_ptr(&doc) as usize,
+            tag: self.indexed_tag.clone(),
+            records: ranges.len(),
+            format: self.format,
+            options: self.options.clone(),
+        };
+        if let Some(done) = self.columns_job.as_ref().and_then(Job::poll) {
+            self.columns_job = None;
+            if done.key == key {
+                self.columns_for = None;
+                match done.columns {
+                    Ok(columns) => {
+                        self.encoder = Some(Arc::new(Encoder::new(&doc, &key.tag, key.format, &key.options, columns)));
+                        self.encoder_key = Some(key.clone());
+                        self.preview.invalidate();
+                        self.refresh_selected();
+                    }
+                    Err(e) => self.set_status(format!("Cannot list the columns: {e}"), true),
+                }
+            }
+        }
+        if self.encoder_key.as_ref() == Some(&key) {
+            return;
+        }
+        if key.format.is_table() {
+            if self.columns_for.as_ref() != Some(&key) {
+                if let Some(job) = self.columns_job.take() {
+                    job.cancel();
+                }
+                self.encoder = None;
+                self.encoder_key = None;
+                self.preview.invalidate();
+                self.refresh_selected();
+                let job_key = key.clone();
+                self.columns_job = Some(Job::spawn(ctx, move |progress| {
+                    let columns = engine::collect_columns(&doc, &ranges, &job_key.options, progress);
+                    ColumnsDone { key: job_key, columns }
+                }));
+                self.columns_for = Some(key);
+            }
+            return;
+        }
+        self.columns_for = None;
+        if let Some(job) = self.columns_job.take() {
+            job.cancel();
+        }
+        self.encoder = Some(Arc::new(Encoder::new(&doc, &key.tag, key.format, &key.options, Vec::new())));
+        self.encoder_key = Some(key);
+        self.preview.invalidate();
+        self.refresh_selected();
     }
 
     fn summary_of(&mut self, record: u32) -> String {
@@ -898,6 +1004,7 @@ impl App {
     pub fn draw(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         self.poll_jobs(&ctx);
+        self.ensure_encoder(&ctx);
 
         let dropped = ui.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).find(|p| !p.as_os_str().is_empty()));
         if let Some(path) = dropped {
@@ -924,7 +1031,7 @@ impl App {
             ui.label(RichText::new(&self.status.text).color(color));
             ui.add_space(3.0);
         });
-        if self.selected.is_some() && self.view == View::Records {
+        if self.selected.is_some() && self.view != View::Text {
             egui::Panel::right("json").resizable(true).default_size(420.0).min_size(240.0).show(ui, |ui| self.json_panel(ui));
         }
         egui::CentralPanel::default().show(ui, |ui| {
@@ -943,11 +1050,24 @@ impl App {
                         self.view = View::Records;
                         self.view_chosen = true;
                     }
+                    if self.kind.is_some()
+                        && ui
+                            .selectable_label(self.view == View::Preview, format!("As {}", self.format.name()))
+                            .on_hover_text("The whole file in the selected format, exactly as Save writes it. Change the format above to see it another way.")
+                            .clicked()
+                    {
+                        self.view = View::Preview;
+                        self.view_chosen = true;
+                        if let (Some(record), Some(doc), Some(ranges), Some(encoder)) = (self.selected, &self.doc, &self.ranges, &self.encoder) {
+                            self.preview.reveal(&preview::Source::new(doc, ranges, encoder), record as usize);
+                        }
+                    }
                 });
                 ui.add_space(2.0);
             }
             match self.view {
                 View::Records => self.records_panel(ui),
+                View::Preview => self.preview_panel(ui),
                 View::Text => match self.text.clone() {
                     Some(text) => self.textview.draw(ui, &text),
                     None => {
@@ -959,8 +1079,29 @@ impl App {
                 },
             }
         });
-        if let Some((text, error)) = self.textview.status.take() {
+        if let Some((text, error)) = self.textview.status.take().or_else(|| self.preview.status.take()) {
             self.set_status(text, error);
+        }
+    }
+
+    fn preview_panel(&mut self, ui: &mut egui::Ui) {
+        let (Some(doc), Some(ranges)) = (self.doc.clone(), self.ranges.clone()) else {
+            ui.centered_and_justified(|ui| ui.label(RichText::new("Reading…").weak().size(16.0)));
+            return;
+        };
+        if ranges.is_empty() {
+            ui.centered_and_justified(|ui| ui.label(RichText::new("No records to show.").weak().size(16.0)));
+            return;
+        }
+        let Some(encoder) = self.encoder.clone() else {
+            ui.centered_and_justified(|ui| {
+                ui.label(RichText::new(format!("Finding the {} columns of every record…", self.format.name())).weak().size(16.0))
+            });
+            return;
+        };
+        let src = preview::Source::new(&doc, &ranges, &encoder);
+        if let Some(record) = self.preview.draw(ui, &src) {
+            self.select(record);
         }
     }
 
@@ -1036,6 +1177,8 @@ impl App {
                     });
             });
             if self.format != before {
+                self.ensure_encoder(&ctx);
+                ctx.request_repaint();
                 if let Some((stem, ext)) = self.output.rsplit_once('.') {
                     let known = ext == "json" || Format::from_extension(ext).is_some();
                     if known && !stem.ends_with(['/', '\\']) {
@@ -1059,7 +1202,11 @@ impl App {
                         job.cancel();
                     }
                 }
-            } else if ui.add_enabled(has_doc, egui::Button::new(RichText::new("Convert").strong())).clicked() {
+            } else if ui
+                .add_enabled(has_doc, egui::Button::new(RichText::new("💾 Save").strong()))
+                .on_hover_text("Write the whole file in the selected format (what the preview shows)")
+                .clicked()
+            {
                 self.start_convert(&ctx, false);
             }
         });
@@ -1340,7 +1487,7 @@ impl App {
         ui.add_space(6.0);
         ui.horizontal(|ui| {
             ui.label(RichText::new(format!("Record #{}", group(record as u64 + 1))).strong());
-            ui.label(RichText::new("exact JSON output").weak());
+            ui.label(RichText::new(format!("as {}", self.format.name())).weak());
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.button("✕").on_hover_text("Close").clicked() {
                     self.selected = None;
@@ -1348,7 +1495,7 @@ impl App {
                 if ui.button("Copy").clicked() {
                     if let Some((_, json)) = &self.selected_json {
                         ui.ctx().copy_text(json.clone());
-                        self.status = Status { text: "Copied the record's JSON.".into(), error: false };
+                        self.status = Status { text: format!("Copied the record as {}.", self.format.name()), error: false };
                     }
                 }
             });
@@ -1656,6 +1803,72 @@ mod tests {
         assert_eq!(lines.next(), Some("id,name,tags,n"));
         assert_eq!(lines.next(), Some("0000,Bolt 0,a,0.5"));
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn live_preview_follows_the_format() {
+        let dir = temp_dir("preview");
+        let path = sample(&dir, 20_000);
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.open(path, &ctx);
+        wait(&ctx, &mut app, |a| a.ranges.as_ref().is_some_and(|r| !r.is_empty()));
+        frame(&ctx, &mut app, vec![]);
+        app.view = View::Preview;
+        app.select(1);
+        for format in Format::ALL {
+            app.format = format;
+            wait(&ctx, &mut app, |a| a.encoder.as_ref().is_some_and(|e| e.format == format));
+            frame(&ctx, &mut app, vec![]);
+            let shown = &app.selected_json.as_ref().unwrap().1;
+            let expected_start = match format {
+                Format::Pretty => "{\n  \"id\": \"00001\"",
+                Format::Compact | Format::Ndjson => "{\"id\":\"00001\"",
+                Format::Yaml => "- id: \"00001\"",
+                Format::Xml => "  <part id=\"00001\">",
+                Format::Csv => "id,name,price.cur,price\n00001,Bolt 1,EUR; USD,1.5; 1.9",
+                Format::Tsv => "id\tname\tprice.cur\tprice\n00001\tBolt 1\tEUR; USD\t1.5; 1.9",
+            };
+            assert!(shown.starts_with(expected_start), "{format:?}: {shown}");
+            // Scrolling the preview far down renders only what is on screen.
+            for _ in 0..30 {
+                frame(&ctx, &mut app, vec![egui::Event::Key { key: Key::PageDown, physical_key: None, pressed: true, repeat: false, modifiers: Default::default() }]);
+            }
+            frame(&ctx, &mut app, vec![egui::Event::Key { key: Key::End, physical_key: None, pressed: true, repeat: false, modifiers: Default::default() }]);
+        }
+
+        // Save writes the selected format.
+        app.format = Format::Yaml;
+        app.output = dir.join("out.yaml").display().to_string();
+        app.start_convert(&ctx, false);
+        wait(&ctx, &mut app, |a| a.convert_job.is_none());
+        assert!(app.status.text.starts_with("Wrote 20,000 records"), "{}", app.status.text);
+        assert!(std::fs::read_to_string(dir.join("out.yaml")).unwrap().starts_with("- id: \"00000\""));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Run with: TOME_BIG=/path/big.xml cargo test --release preview_timings -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn preview_timings() {
+        let Ok(path) = std::env::var("TOME_BIG") else { return };
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.open(PathBuf::from(path), &ctx);
+        wait(&ctx, &mut app, |a| a.index_job.is_none() && a.ranges.is_some());
+        app.view = View::Preview;
+        for format in Format::ALL {
+            let t = Instant::now();
+            app.format = format;
+            wait(&ctx, &mut app, |a| a.encoder.as_ref().is_some_and(|e| e.format == format));
+            frame(&ctx, &mut app, vec![]);
+            let first = t.elapsed().as_secs_f64() * 1000.0;
+            let t = Instant::now();
+            for _ in 0..20 {
+                frame(&ctx, &mut app, vec![egui::Event::Key { key: Key::PageDown, physical_key: None, pressed: true, repeat: false, modifiers: Default::default() }]);
+            }
+            println!("{:<13} first view {:>7.1} ms   page down {:.2} ms/frame", format.name(), first, t.elapsed().as_secs_f64() * 1000.0 / 20.0);
+        }
     }
 
     /// Run with: TOME_BIG_TEXT=/path/file cargo test --release big_text -- --ignored --nocapture

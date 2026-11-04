@@ -416,16 +416,139 @@ fn encode_record(out: &mut Vec<u8>, obj: &xml::Obj, format: Format, first: bool)
     }
 }
 
-/// Everything a worker needs to encode generic records.
-struct Encoder<'a> {
-    format: Format,
-    record_name: &'a str,
-    xml_style: XmlStyle<'a>,
-    columns: HashMap<&'a str, usize>,
+/// Turns records into output bytes for one format. Saving and the live
+/// preview both use it, so the preview shows exactly what is written.
+pub struct Encoder {
+    pub format: Format,
+    options: Options,
+    record_name: String,
+    scalars: XmlScalars,
+    /// CSV/TSV columns (empty for other formats).
+    pub columns: Vec<String>,
+    column_index: HashMap<String, usize>,
     width: usize,
+    /// Use the original XML-to-JSON writers.
+    fast: bool,
 }
 
-impl Encoder<'_> {
+impl Encoder {
+    /// `columns` matters only for CSV/TSV; see [`collect_columns`].
+    pub fn new(doc: &Doc, selector: &str, format: Format, options: &Options, columns: Vec<String>) -> Encoder {
+        let record_name = match doc.kind {
+            Kind::Xml => xml::local_name(selector).to_string(),
+            Kind::Json => "record".to_string(),
+        };
+        Encoder {
+            format,
+            options: options.clone(),
+            record_name,
+            scalars: if doc.kind == Kind::Xml { XmlScalars::Attributes } else { XmlScalars::Elements },
+            column_index: columns.iter().enumerate().map(|(i, c)| (c.clone(), i)).collect(),
+            width: columns.len(),
+            columns,
+            fast: fast_path(doc, options) && format.is_json(),
+        }
+    }
+
+    fn delimiter(&self) -> u8 {
+        if self.format == Format::Tsv { b'\t' } else { b',' }
+    }
+
+    /// What comes before the first record.
+    pub fn header(&self) -> Vec<u8> {
+        let mut header = Vec::new();
+        match self.format {
+            Format::Compact | Format::Pretty => header.push(b'['),
+            Format::Xml => header.extend_from_slice(b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<records>\n"),
+            Format::Csv | Format::Tsv => {
+                let delimiter = self.delimiter();
+                for (i, c) in self.columns.iter().enumerate() {
+                    if i > 0 {
+                        header.push(delimiter);
+                    }
+                    node::write_csv_field(&mut header, c, delimiter);
+                }
+                header.push(b'\n');
+            }
+            Format::Ndjson | Format::Yaml => {}
+        }
+        header
+    }
+
+    /// What comes after the last record.
+    pub fn footer(&self) -> &'static [u8] {
+        match self.format {
+            Format::Compact | Format::Pretty => b"\n]\n",
+            Format::Xml => b"</records>\n",
+            _ => b"",
+        }
+    }
+
+    /// Append record `range` as it appears in the output file.
+    fn encode_range(&self, doc: &Doc, range: (usize, usize), out: &mut Vec<u8>, first: bool) -> XResult<()> {
+        if self.fast {
+            let obj = xml::parse_record(doc.bytes(), range, &doc.entities)?;
+            encode_record(out, &obj, self.format, first);
+        } else {
+            let node = node_of(doc, range, &self.options)?;
+            self.encode(out, &node, first);
+        }
+        Ok(())
+    }
+
+    /// Record `index` of `total` as lines of the output file: the bytes it
+    /// adds, with the separators moved so that joining every block (header,
+    /// records, footer) with newlines gives the file exactly.
+    pub fn preview_block(&self, doc: &Doc, range: (usize, usize), index: usize, total: usize) -> Result<String> {
+        let mut out = Vec::new();
+        self.encode_range(doc, range, &mut out, index == 0).map_err(|e| doc.xml_error(e))?;
+        let mut text = String::from_utf8(out).expect("output is UTF-8");
+        match self.format {
+            Format::Compact | Format::Pretty => {
+                let body = text.strip_prefix(",\n").or_else(|| text.strip_prefix('\n')).unwrap_or(&text);
+                let mut body = body.to_string();
+                if index + 1 < total {
+                    body.push(',');
+                }
+                text = body;
+            }
+            _ => {
+                if text.ends_with('\n') {
+                    text.pop();
+                }
+            }
+        }
+        Ok(text)
+    }
+
+    /// Header and footer as preview lines (`None` when the format has none).
+    pub fn preview_header(&self) -> Option<String> {
+        let h = String::from_utf8(self.header()).expect("UTF-8");
+        let h = h.strip_suffix('\n').unwrap_or(&h).to_string();
+        if h.is_empty() && self.width == 0 && !self.format.is_table() { None } else { Some(h) }
+    }
+
+    pub fn preview_footer(&self) -> Option<String> {
+        let f = std::str::from_utf8(self.footer()).expect("UTF-8");
+        let f = f.trim_start_matches('\n').trim_end_matches('\n');
+        if f.is_empty() { None } else { Some(f.to_string()) }
+    }
+
+    /// One record on its own, for the record panel: pretty JSON for the
+    /// JSON formats, the header plus the row for CSV/TSV.
+    pub fn render_one(&self, doc: &Doc, range: (usize, usize)) -> Result<String> {
+        let text = match self.format {
+            Format::Pretty | Format::Compact | Format::Ndjson => return record_json(doc, range, self.format == Format::Pretty, &self.options),
+            Format::Csv | Format::Tsv => {
+                let mut header = String::from_utf8(self.header()).expect("UTF-8");
+                header.push_str(&self.preview_block(doc, range, 0, 1)?);
+                header
+            }
+            Format::Yaml | Format::Xml => self.preview_block(doc, range, 0, 1)?,
+        };
+        Ok(text)
+    }
+
     fn encode(&self, out: &mut Vec<u8>, node: &Node, first: bool) {
         match self.format {
             Format::Compact => {
@@ -443,16 +566,17 @@ impl Encoder<'_> {
             Format::Yaml => node::write_yaml_record(out, node),
             Format::Xml => {
                 out.extend_from_slice(b"  ");
-                node::write_xml_element(out, self.record_name, node, 2, &self.xml_style);
+                let style = XmlStyle { scalars: self.scalars, attr_prefix: &self.options.attr_prefix };
+                node::write_xml_element(out, &self.record_name, node, 2, &style);
                 out.push(b'\n');
             }
             Format::Csv | Format::Tsv => {
-                let delimiter = if self.format == Format::Csv { b',' } else { b'\t' };
+                let delimiter = self.delimiter();
                 let mut cells = Vec::new();
                 node::flatten(node, &mut cells);
                 let mut row: Vec<&str> = vec![""; self.width];
                 for (column, value) in &cells {
-                    if let Some(&i) = self.columns.get(column.as_str()) {
+                    if let Some(&i) = self.column_index.get(column.as_str()) {
                         row[i] = value;
                     }
                 }
@@ -563,7 +687,7 @@ fn fast_path(doc: &Doc, options: &Options) -> bool {
 pub static FORCE_GENERIC: AtomicBool = AtomicBool::new(false);
 
 /// CSV columns: every flattened key, in order of first appearance.
-fn collect_columns(doc: &Doc, ranges: &[(usize, usize)], options: &Options, progress: &Progress) -> Result<Vec<String>> {
+pub fn collect_columns(doc: &Doc, ranges: &[(usize, usize)], options: &Options, progress: &Progress) -> Result<Vec<String>> {
     let per_batch: Vec<XResult<Vec<String>>> = ranges
         .par_chunks(BATCH)
         .map(|batch| {
@@ -614,45 +738,10 @@ fn convert_to(doc: &Doc, selector: &str, temporary: &Path, format: Format, optio
         });
     }
 
-    let fast = fast_path(doc, options) && format.is_json();
     let columns = if format.is_table() { collect_columns(doc, ranges, options, progress)? } else { Vec::new() };
-    let record_name = match doc.kind {
-        Kind::Xml => xml::local_name(selector),
-        Kind::Json => "record",
-    };
-    let encoder = Encoder {
-        format,
-        record_name,
-        xml_style: XmlStyle {
-            scalars: if doc.kind == Kind::Xml { XmlScalars::Attributes } else { XmlScalars::Elements },
-            attr_prefix: &options.attr_prefix,
-        },
-        columns: columns.iter().enumerate().map(|(i, c)| (c.as_str(), i)).collect(),
-        width: columns.len(),
-    };
-    let mut header = Vec::new();
-    let footer: &[u8] = match format {
-        Format::Compact | Format::Pretty => {
-            header.push(b'[');
-            b"\n]\n"
-        }
-        Format::Xml => {
-            header.extend_from_slice(b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<records>\n");
-            b"</records>\n"
-        }
-        Format::Csv | Format::Tsv => {
-            let delimiter = if format == Format::Csv { b',' } else { b'\t' };
-            for (i, c) in columns.iter().enumerate() {
-                if i > 0 {
-                    header.push(delimiter);
-                }
-                node::write_csv_field(&mut header, c, delimiter);
-            }
-            header.push(b'\n');
-            b""
-        }
-        Format::Ndjson | Format::Yaml => b"",
-    };
+    let encoder = Encoder::new(doc, selector, format, options, columns);
+    let header = encoder.header();
+    let footer = encoder.footer();
 
     let bytes = doc.bytes();
     let window = BATCH * worker_count() * 2;
@@ -685,14 +774,7 @@ fn convert_to(doc: &Doc, selector: &str, temporary: &Path, format: Format, optio
                 .map(|(b, batch)| {
                     let mut out = Vec::with_capacity(batch.iter().map(|r| r.1 - r.0).sum::<usize>() * 2);
                     for (i, &range) in batch.iter().enumerate() {
-                        let first = base + b * BATCH + i == 0;
-                        if fast {
-                            let obj = xml::parse_record(bytes, range, &doc.entities)?;
-                            encode_record(&mut out, &obj, format, first);
-                        } else {
-                            let node = node_of(doc, range, options)?;
-                            encoder.encode(&mut out, &node, first);
-                        }
+                        encoder.encode_range(doc, range, &mut out, base + b * BATCH + i == 0)?;
                     }
                     Ok(out)
                 })
@@ -727,6 +809,30 @@ fn convert_to(doc: &Doc, selector: &str, temporary: &Path, format: Format, optio
         return Err(doc.xml_error(e));
     }
     progress.bytes.store(bytes.len() as u64, Ordering::Relaxed);
+    Ok(ranges.len() as u64)
+}
+
+/// Test hook (`--via-preview`): write the file by joining the preview
+/// blocks, to prove the preview shows exactly what saving writes.
+pub fn write_via_preview(doc: &Doc, selector: &str, output: &Path, format: Format, options: &Options) -> Result<u64> {
+    let (ranges, error, _) = records(doc, selector)?;
+    if let Some(e) = error {
+        return Err(doc.xml_error(e));
+    }
+    if ranges.is_empty() {
+        return Err(Error::NoRecords(selector.to_string()));
+    }
+    let columns = if format.is_table() { collect_columns(doc, &ranges, options, &Progress::default())? } else { Vec::new() };
+    let encoder = Encoder::new(doc, selector, format, options, columns);
+    let mut blocks = Vec::new();
+    blocks.extend(encoder.preview_header());
+    for (i, &range) in ranges.iter().enumerate() {
+        blocks.push(encoder.preview_block(doc, range, i, ranges.len())?);
+    }
+    blocks.extend(encoder.preview_footer());
+    let mut text = blocks.join("\n");
+    text.push('\n');
+    std::fs::write(output, text)?;
     Ok(ranges.len() as u64)
 }
 

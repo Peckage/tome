@@ -327,6 +327,14 @@ def other_formats(name, path, tag, py, expected_pretty, py_nd, workdir) -> list[
         if rows != expected_rows:
             problems.append(f"{name}: {ext.upper()} differs\n  expected: {expected_rows[:3]!r}\n  rust:     {str(got)[:300]!r}")
 
+    # The live preview shows exactly what saving writes, in every format.
+    for fmt in ["json", "pretty", "ndjson", "yaml", "xml", "csv", "tsv"]:
+        for extra in ([], ["--simple", "--remove-empty"]):
+            ok_a, a = run_rust(path, out("save.out"), tag, ["--format", fmt] + extra)
+            ok_b, b = run_rust(path, out("preview.out"), tag, ["--format", fmt, "--via-preview"] + extra)
+            if not (ok_a and ok_b and a == b):
+                problems.append(f"{name}: preview differs from saved {fmt} {' '.join(extra)}\n  saved:   {str(a)[:300]!r}\n  preview: {str(b)[:300]!r}")
+
     # Clean-up options.
     for flags, model in OPTION_SETS:
         expected = json_array([model_options(r, **model) for r in records])
