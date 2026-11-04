@@ -1,3 +1,9 @@
+// Windows: tome.exe is a GUI program, so starting it from Explorer, the
+// Start menu or "Open with" opens no console window. tome-cli.exe is the same
+// program built as a console program (the "console" feature) for terminals,
+// where the shell waits for it, shows its output and gets its exit code.
+#![cfg_attr(all(windows, not(test), not(feature = "console")), windows_subsystem = "windows")]
+
 mod cli;
 mod edit;
 mod engine;
@@ -47,12 +53,60 @@ fn main() {
         // argv[2] (tag argv[3]) at several chunk sizes. Used by the tests.
         std::process::exit(check_scan(&argv[2], &argv[3]));
     }
+    // tome.exe on Windows has no console of its own: borrow the terminal's
+    // for command-line use, so --help and errors are visible there.
+    #[cfg(all(windows, not(feature = "console")))]
+    if argv.len() > 2 || argv.get(1).is_some_and(|a| a.starts_with('-')) {
+        attach_console();
+    }
     let code = match cli::parse(argv) {
         cli::Command::Convert(args) => cli::run(args),
         cli::Command::Gui(path) => gui::run(path),
         cli::Command::Exit(code) => code,
     };
     std::process::exit(code);
+}
+
+/// Attach to the console of the program that started us, if any, and point
+/// stdout/stderr at it unless they were redirected.
+#[cfg(all(windows, not(feature = "console")))]
+fn attach_console() {
+    use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING};
+    use windows_sys::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole, GetStdHandle, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE, SetStdHandle};
+    // SAFETY: plain Win32 calls with valid arguments; the handle is kept
+    // open for the rest of the process.
+    unsafe {
+        if AttachConsole(ATTACH_PARENT_PROCESS) == 0 {
+            return;
+        }
+        let name: Vec<u16> = "CONOUT$\0".encode_utf16().collect();
+        let mut console = INVALID_HANDLE_VALUE;
+        for id in [STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+            let current = GetStdHandle(id);
+            if current.is_null() || current == INVALID_HANDLE_VALUE {
+                if console == INVALID_HANDLE_VALUE {
+                    console = CreateFileW(
+                        name.as_ptr(),
+                        GENERIC_READ | GENERIC_WRITE,
+                        FILE_SHARE_READ | FILE_SHARE_WRITE,
+                        std::ptr::null(),
+                        OPEN_EXISTING,
+                        0,
+                        std::ptr::null_mut(),
+                    );
+                }
+                if console != INVALID_HANDLE_VALUE {
+                    SetStdHandle(id, console);
+                }
+            }
+        }
+        // The shell has already printed its next prompt; start below it.
+        // (Only on the console: redirected output stays exactly as is.)
+        if console != INVALID_HANDLE_VALUE && GetStdHandle(STD_OUTPUT_HANDLE) == console {
+            println!();
+        }
+    }
 }
 
 fn check_scan(path: &str, tag: &str) -> i32 {

@@ -23,9 +23,19 @@ regex = "1.13"
 rfd = "0.17"
 png = { version = "0.18", optional = true }
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Console"] }
+
+[target.'cfg(windows)'.build-dependencies]
+# Puts the icon and version information into tome.exe.
+winresource = "0.1"
+
 [features]
 # Screenshot mode for the README (TOME_SCREENSHOT / TOME_DEMO).
 screenshots = ["dep:png"]
+# Windows: build a console program (tome-cli.exe) instead of a GUI program
+# (tome.exe). No effect elsewhere.
+console = []
 
 [profile.release]
 lto = "fat"

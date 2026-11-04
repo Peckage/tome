@@ -271,7 +271,7 @@ pub fn finish_save(temporary: &Path, source: &Path, target: &Path) -> io::Result
     if let Ok(meta) = std::fs::metadata(source) {
         let _ = std::fs::set_permissions(temporary, meta.permissions());
     }
-    std::fs::rename(temporary, target)
+    crate::engine::replace_file(temporary, target)
 }
 
 /// A search hit on a (possibly edited) line: byte columns within the line.
@@ -333,6 +333,29 @@ mod tests {
         let mut out = Vec::new();
         e.write_to(f, &mut out).unwrap();
         out
+    }
+
+    /// Saving while a background job still has the old file mapped: Windows
+    /// refuses to replace a mapped file, so the save waits for the job to let
+    /// go instead of failing.
+    #[test]
+    fn save_over_a_file_still_mapped_elsewhere() {
+        let (f, path) = file("mapped.txt", b"old\n");
+        let mut e = Edits::new(f.line_count());
+        e.set_line(0, "new".into());
+        let temporary = write_temporary(&e, &f, &path).unwrap();
+        let held = std::sync::Arc::new(f);
+        let job = {
+            let held = held.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                drop(held);
+            })
+        };
+        drop(held);
+        finish_save(&temporary, &path, &path).unwrap();
+        job.join().unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"new\n");
     }
 
     #[test]
