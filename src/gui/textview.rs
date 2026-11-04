@@ -544,7 +544,7 @@ impl TextView {
             let field = ui.add(
                 egui::TextEdit::singleline(&mut self.search)
                     .hint_text("Find (Ctrl+F). Case-insensitive unless you type capitals.")
-                    .desired_width((ui.available_width() - 560.0).max(160.0)),
+                    .desired_width((ui.available_width() - 720.0).max(160.0)),
             );
             if std::mem::take(&mut self.focus_search) {
                 field.request_focus();
@@ -581,7 +581,7 @@ impl TextView {
                     None => format!("{}{more} matches", group(m.len() as u64)),
                 };
                 ui.label(RichText::new(label).weak());
-                if ui.small_button("✕").on_hover_text("Clear search").clicked() {
+                if ui.small_button("×").on_hover_text("Clear search").clicked() {
                     self.clear_search();
                 }
             }
@@ -609,7 +609,7 @@ impl TextView {
                 ui.label(RichText::new("🔒 read-only").weak()).on_hover_text(reason.as_str());
             } else if self.dirty() {
                 ui.separator();
-                ui.label(RichText::new("● unsaved").color(ui.visuals().warn_fg_color));
+                ui.label(RichText::new("• unsaved").color(ui.visuals().warn_fg_color));
                 if ui.button("Save").on_hover_text("Save the edits to this file (Ctrl+S)").clicked() {
                     self.commit_edit();
                     self.save_request = Some(SaveRequest::Save);

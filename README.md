@@ -1,10 +1,29 @@
 # Tome
 
-A text viewer and converter built for heavy files.
+[![CI](https://github.com/Peckage/tome/actions/workflows/ci.yml/badge.svg)](https://github.com/Peckage/tome/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/Peckage/tome)](https://github.com/Peckage/tome/releases)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-Tome opens files of hundreds of megabytes instantly, lets you scroll and search millions of lines or records, and converts XML and JSON to JSON, NDJSON, YAML, XML, CSV and TSV. It is a single native binary (Rust, egui) with a window and a command line. It started life as `xml2json`, and that converter is still its core.
+**A text editor, viewer and converter built for huge files.** Tome opens a 500 MB file in a fraction of a second, scrolls and searches millions of lines without loading them, edits them, and converts XML and JSON to JSON, NDJSON, YAML, XML, CSV or TSV. You can preview the result live before saving.
 
-On a 501 MB file with 2.6 million records (20-core i7-13650HX, file already in the page cache):
+![Tome searching a 447 MB log with 5 million lines](docs/text.png)
+
+## Highlights
+
+- **Instant on huge files.** Files are memory-mapped and indexed on all cores. A 448 MB log with 5 million lines opens in 0.04 s and searches in 0.02 s. Only what is on screen is ever decoded.
+- **Edit anything, any size.** A piece table over the mapped file makes edits cost microseconds. Undo/redo, find & replace with regex groups, and safe saves (temp file and rename) that keep line endings byte for byte. Save + reopen of 448 MB takes 0.31 s.
+- **Records view.** XML and JSON files are split into records: browse 1.3 million records as a tree, and search them in parallel.
+- **Live format preview.** Switch between Pretty JSON, NDJSON, YAML, XML, CSV and TSV and see the whole file in that format in under 10 ms, then save exactly that.
+- **Clean-up on the way out.** Trim, collapse whitespace, remove empty values, unwrap one-item lists, drop fields, or use xmltodict-style output.
+- **Correct.** XML→JSON is byte-identical to a Python reference across 1,000+ generated documents. Every format is checked against a Python model, and the editor is tested against a random model. CI runs on Linux, Windows and macOS.
+
+| Records view | Live preview as YAML | JSON as CSV |
+|---|---|---|
+| ![Records view](docs/records.png) | ![Preview as YAML](docs/preview.png) | ![JSON previewed as CSV](docs/csv.png) |
+
+## Speed
+
+On a 501 MB XML file with 2.6 million records (20-core i7-13650HX, file already in the page cache):
 
 | Step | Time |
 |---|---|
@@ -15,16 +34,24 @@ On a 501 MB file with 2.6 million records (20-core i7-13650HX, file already in t
 | Convert to pretty JSON (951 MB) | 0.64 s |
 | Previous Python version (compact) | 29.3 s |
 
-The compact output is byte-for-byte identical to the Python version's.
+Other formats on a 229 MB file with 1.3 million records take 0.25–0.6 s each (CSV is the slowest, because it finds every column first).
 
 ## Install
 
+**Download** a build for Linux (x86_64), Windows (x86_64) or macOS (Apple silicon) from [Releases](https://github.com/Peckage/tome/releases). It is a single executable. The macOS build is not signed: right-click it and choose Open the first time.
+
+**From source** (current stable Rust):
+
 ```sh
-./install.sh            # builds, copies the binary to ./bin, adds "Tome" to the app menu
-./install.sh --remove   # removes the menu entry
+git clone https://github.com/Peckage/tome && cd tome
+cargo build --release              # target/release/tome
+./install.sh                       # Linux: copies the binary to ./bin and adds "Tome" to the app menu
+./install.sh --remove              # removes the menu entry
 ```
 
-The menu entry also shows up under "Open with" for text, XML and JSON files (it is not made the default app). Outside this folder the script writes only `~/.local/share/applications/io.github.peckage.Tome.desktop` (and removes the old `io.github.xml2json.Converter.desktop`), and it refreshes `mimeinfo.cache` in that folder.
+`.cargo/config.toml` builds for your own CPU (`target-cpu=native`). Remove that line to build a binary for other machines.
+
+On Linux the menu entry also shows up under "Open with" for text, XML and JSON files (it is not made the default app). Outside the repository the script writes only `~/.local/share/applications/io.github.peckage.Tome.desktop` (and removes the old `io.github.xml2json.Converter.desktop`), and it refreshes `mimeinfo.cache` in that folder.
 
 ## Text view
 
@@ -151,7 +178,7 @@ Malformed XML is rejected the same way Python's expat rejects it: unclosed or mi
 2. **Parallel scan.** The file is cut into chunks and every core finds tag boundaries in its own chunk, using SIMD-accelerated `memchr`. Each chunk starts at a guessed `<`. A quick sequential pass then checks the guesses, joins the nesting across chunks and rescans any chunk whose guess fell inside a comment or CDATA.
 3. **Parallel conversion.** Records are parsed straight from the mapped bytes, copying strings only when entities have to be expanded. They are encoded to JSON in batches on all cores. A writer thread writes the batches in order to `<output>.tmp`, which is renamed when everything has succeeded.
 
-For pretty output most of the remaining time is writing the roughly 1 GB file. The build uses `target-cpu=native` (`.cargo/config.toml`), so the binary is tuned for this CPU. Remove that line to build a binary that runs on other x86-64 machines.
+For pretty output most of the remaining time is writing the roughly 1 GB file.
 
 ## Tests
 
@@ -175,3 +202,21 @@ For each case that converts, it also checks:
 - Four combinations of clean-up options match a Python model of them.
 
 `python/` holds the original Python/GTK version. It is kept as the reference implementation for these tests.
+
+## Project layout
+
+| Path | What it does |
+|---|---|
+| `src/text.rs` | Memory-mapped text, the parallel line index, search |
+| `src/edit.rs` | The piece table, saving, edit-aware search |
+| `src/xml.rs`, `src/pscan.rs` | XML tokenizer, record parser and parallel scanner |
+| `src/jsonin.rs` | JSON reader: locating records, parsing with exact numbers |
+| `src/node.rs` | Format-neutral records, clean-up options, YAML/XML/CSV writers |
+| `src/json.rs` | The JSON writers that must match Python byte for byte |
+| `src/engine.rs` | Opening files, the parallel conversion pipeline, the shared encoder |
+| `src/gui.rs`, `src/gui/` | The window: text view, records view, live preview |
+| `python/` | The original Python version, kept as the reference for tests |
+
+## License
+
+[MIT](LICENSE)

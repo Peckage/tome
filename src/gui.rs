@@ -20,6 +20,8 @@ use crate::engine::{self, Doc, Encoder, Error, Format, Kind, Progress};
 use crate::node::{Node, Options};
 use crate::text::TextFile;
 
+#[cfg(feature = "screenshots")]
+mod demo;
 mod preview;
 mod textview;
 use preview::PreviewView;
@@ -395,6 +397,8 @@ pub struct App {
     title: String,
     /// The file was just reopened after saving: keep the "Saved" message.
     quiet_open: bool,
+    #[cfg(feature = "screenshots")]
+    demo: Option<demo::Demo>,
 
     status: Status,
 }
@@ -466,8 +470,20 @@ impl Default for App {
             allow_close: false,
             title: String::new(),
             quiet_open: false,
+            #[cfg(feature = "screenshots")]
+            demo: demo::Demo::from_env(),
             status: Status { text: "Open a file (Ctrl+O), or drop one on this window.".into(), error: false },
         }
+    }
+}
+
+/// A folder for display, with the home folder shortened to `~`.
+fn short_dir(dir: &Path) -> String {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    match home.and_then(|h| dir.strip_prefix(&h).ok().map(Path::to_path_buf)) {
+        Some(rest) if rest.as_os_str().is_empty() => "~".into(),
+        Some(rest) => format!("~/{}", rest.display()),
+        None => dir.display().to_string(),
     }
 }
 
@@ -1241,7 +1257,7 @@ impl App {
         egui::CentralPanel::default().show(ui, |ui| {
             if self.path.is_some() {
                 ui.horizontal(|ui| {
-                    let text_label = if self.textview.dirty() { "Text ●" } else { "Text" };
+                    let text_label = if self.textview.dirty() { "Text •" } else { "Text" };
                     if ui.selectable_label(self.view == View::Text, text_label).on_hover_text("Every line of the file. Double-click a line to edit it.").clicked() {
                         self.view = View::Text;
                         self.view_chosen = true;
@@ -1325,10 +1341,22 @@ impl App {
             }
             match &self.path {
                 Some(p) => {
-                    ui.label(RichText::new(p.display().to_string()).strong());
+                    let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                    ui.label(RichText::new(name).strong()).on_hover_text(p.display().to_string());
+                    #[cfg(feature = "screenshots")]
+                    let show_dir = self.demo.is_none();
+                    #[cfg(not(feature = "screenshots"))]
+                    let show_dir = true;
+                    if show_dir {
+                        if let Some(dir) = p.parent().map(short_dir) {
+                            ui.label(RichText::new(dir).weak());
+                        }
+                    }
                     let mut info = Vec::new();
                     if let Some(doc) = &self.doc {
                         info.push(human_size(doc.file_size));
+                    } else if let Some(text) = &self.text {
+                        info.push(human_size(text.len()));
                     }
                     match self.lines {
                         Some(n) => info.push(format!("{} lines", group(n))),
@@ -1549,7 +1577,7 @@ impl App {
 
     fn unsaved_note(&self, ui: &mut egui::Ui) {
         if self.textview.dirty() {
-            ui.label(RichText::new("● This view shows the file on disk. Your text edits appear here after you save them (Ctrl+S).").color(ui.visuals().warn_fg_color));
+            ui.label(RichText::new("• This view shows the file on disk. Your text edits appear here after you save them (Ctrl+S).").color(ui.visuals().warn_fg_color));
         }
     }
 
@@ -1708,7 +1736,7 @@ impl App {
             ui.label(RichText::new(format!("Record #{}", group(record as u64 + 1))).strong());
             ui.label(RichText::new(format!("as {}", self.format.name())).weak());
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("✕").on_hover_text("Close").clicked() {
+                if ui.button("×").on_hover_text("Close").clicked() {
                     self.selected = None;
                 }
                 if ui.button("Copy").clicked() {
@@ -1768,6 +1796,8 @@ fn default_output(input: &Path, format: Format) -> String {
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.draw(ui);
+        #[cfg(feature = "screenshots")]
+        demo::step(self, &ui.ctx().clone());
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {

@@ -13,12 +13,19 @@ categories = ["text-editors", "command-line-utilities", "parsing"]
 anyhow = "1"
 crossbeam-channel = "0.5"
 eframe = { version = "0.37", default-features = false, features = ["clipboard", "default_fonts", "glow", "wayland", "x11"] }
+# Icons and symbols (📂 💾 ● ◀ ▶ ✕) need the bundled emoji fonts, a separate feature since egui 0.37.
+egui = { version = "0.37", default-features = false, features = ["monochrome_emoji_fonts"] }
 encoding_rs = "0.8"
 memchr = "2.8"
 memmap2 = "0.9"
 rayon = "1.12"
 regex = "1.13"
 rfd = "0.17"
+png = { version = "0.18", optional = true }
+
+[features]
+# Screenshot mode for the README (TOME_SCREENSHOT / TOME_DEMO).
+screenshots = ["dep:png"]
 
 [profile.release]
 lto = "fat"
