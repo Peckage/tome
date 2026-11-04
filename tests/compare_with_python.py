@@ -336,6 +336,91 @@ def other_formats(name, path, tag, py, expected_pretty, py_nd, workdir) -> list[
     return problems
 
 
+BS = chr(92)  # a backslash, kept out of literals so no tool rewrites the escapes
+JSON_CASES: list[tuple[str, str, str]] = [
+    ("json scalars and keys", "in.json",
+     '[{"n":-0,"f":1.50,"e":1e5,"E":2E-3,"g":1.5e10,"big":123456789012345678901234567890,'
+     '"t":true,"no":false,"z":null,"nested":[[1,[2]],[]],"empty":{},'
+     f'"u":"é😀 a{BS}u0001b {BS}ud83d{BS}ude00 {BS}" {BS}{BS} {BS}n end",'
+     '"":"empty key","1 bad":"k","a b":"c","#text":"t","@x":"at","xmlData":"x","yes":"no"}]'),
+    ("json scalar records", "in.json", '[1, "two", null, true, [3, [4]], {}, []]'),
+    ("json nested path", "in.json",
+     '{"meta":{"n":1},"items":[{"a":{"b":{"c":"deep"}}},{"a":[{"b":1},{"b":"2"}],"x":"00123"}]}'),
+    ("ndjson", "in.ndjson", f'{{"a":1}}\n{{"a":"x{BS}ty","b":[true,null]}}\n\n{{"c":{{}}}}\n'),
+    ("json lines one record", "in.jsonl", '{"only":[1,2,3]}\n'),
+]
+
+
+def json_input(name: str, file: str, text: str, workdir: str) -> list[str]:
+    """JSON input to every format: checked against what Python reads."""
+    problems = []
+    path = os.path.join(workdir, file)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
+    out = lambda n: os.path.join(workdir, n)  # noqa: E731
+    raw = dict(parse_int=str, parse_float=str)  # numbers as written
+    ok, nd = run_rust(path, out("j.ndjson"), None, None)
+    if not ok:
+        return [f"{name}: rust failed: {nd}"]
+    records = [json.loads(line, **raw) for line in nd.decode().splitlines()]
+    values = [json.loads(line) for line in nd.decode().splitlines()]
+    if file == "in.json":
+        source = json.loads(text, **raw)
+        expected = source if isinstance(source, list) else source["items"]
+    else:
+        expected = [json.loads(line, **raw) for line in text.splitlines() if line.strip()]
+    if records != expected:
+        problems.append(f"{name}: NDJSON records differ\n  expected: {expected!r}\n  rust:     {records!r}")
+    for flag, file_out in [(None, "j.json"), ("--pretty", "j.pretty.json")]:
+        ok, got = run_rust(path, out(file_out), None, flag)
+        if not ok or json.loads(got, **raw) != expected:
+            problems.append(f"{name}: {flag or 'compact'} JSON differs: {str(got)[:300]!r}")
+    if yaml is not None:
+        ok, got = run_rust(path, out("j.yaml"), None, None)
+        if not ok or yaml.safe_load(got) != values:
+            problems.append(f"{name}: YAML does not load as the records\n  expected: {values!r}\n  yaml: {str(got)[:400]!r}")
+    ok, got = run_rust(path, out("j.xml"), None, None)
+    try:
+        ET.fromstring(got) if ok else None
+    except ET.ParseError as e:
+        ok = False
+        got = f"{e}: {got[:300]!r}"
+    if not ok:
+        problems.append(f"{name}: XML output is not well-formed: {got}")
+
+    def text_of(v):
+        return "true" if v is True else "false" if v is False else v
+    flat = [{k: v for k, v in flatten_typed(r, text_of).items()} for r in records]
+    columns = list(dict.fromkeys(c for cells in flat for c in cells))
+    expected_rows = [columns] + [[cells.get(c, "") for c in columns] for cells in flat]
+    if len(columns) == 1:
+        pass  # a one-column row with an empty cell is written as ""
+    for ext, delimiter in [("csv", ","), ("tsv", "\t")]:
+        ok, got = run_rust(path, out(f"j.{ext}"), None, None)
+        rows = list(csv.reader(io.StringIO(got.decode(), newline=""), delimiter=delimiter)) if ok else None
+        if rows != expected_rows:
+            problems.append(f"{name}: {ext.upper()} differs\n  expected: {expected_rows!r}\n  rust:     {str(got)[:300]!r}")
+    return problems
+
+
+def flatten_typed(record, text_of) -> dict:
+    cells: dict[str, str] = {}
+
+    def walk(n, path):
+        if isinstance(n, dict):
+            for k, v in n.items():
+                walk(v, (f"{path}.{k}" if path else k) if k != "#text" else (path or "#text"))
+        elif isinstance(n, list):
+            for x in n:
+                walk(x, path)
+        else:
+            col = path or "value"
+            text = "" if n is None else text_of(n)
+            cells[col] = cells[col] + "; " + text if col in cells else text
+    walk(record, "")
+    return cells
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--random", type=int, default=500, help="number of random documents")
@@ -356,11 +441,13 @@ def main() -> int:
             py_ok, _ = run_python(path, os.path.join(workdir, "py.json"), tag, False)
             rs_ok, _ = run_rust(path, os.path.join(workdir, "rs.json"), tag, None)
             print(f"known difference '{name}': python {'accepts' if py_ok else 'rejects'}, rust {'accepts' if rs_ok else 'rejects'}")
+        for name, file, text in JSON_CASES:
+            problems += json_input(name, file, text, workdir)
         rng = random.Random(args.seed)
         for i in range(args.random):
             problems += compare(f"random #{i} (seed {args.seed})", random_document(rng), "part", workdir)
 
-    total = len(CASES) + args.random
+    total = len(CASES) + len(JSON_CASES) + args.random
     for p in problems:
         print("FAIL", p)
     print(f"{total - len(problems)}/{total} cases match" if problems else f"all {total} cases match")

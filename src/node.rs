@@ -332,13 +332,32 @@ fn yaml_scalar(out: &mut Vec<u8>, node: &Node) {
     match node {
         Node::Null => out.extend_from_slice(b"null"),
         Node::Bool(b) => out.extend_from_slice(if *b { b"true" } else { b"false" }),
-        // JSON numbers are valid YAML numbers, except for some forms YAML 1.1
-        // reads differently; quoting those is not needed for JSON's syntax.
-        Node::Num(n) => out.extend_from_slice(n.as_bytes()),
+        Node::Num(n) => write_yaml_number(out, n),
         Node::Str(s) => write_yaml_str(out, s),
         Node::Arr(_) => out.extend_from_slice(b"[]"),
         Node::Obj(_) => out.extend_from_slice(b"{}"),
     }
+}
+
+/// JSON numbers are YAML 1.2 numbers, but YAML 1.1 readers (PyYAML, many
+/// others) only read an exponent as a float with a dot and a signed
+/// exponent: `1e5` would load as the string "1e5". Write the same value as
+/// `1.0e+5` instead.
+fn write_yaml_number(out: &mut Vec<u8>, n: &str) {
+    let Some(e) = n.find(['e', 'E']) else {
+        out.extend_from_slice(n.as_bytes());
+        return;
+    };
+    let (mantissa, exponent) = (&n[..e], &n[e + 1..]);
+    out.extend_from_slice(mantissa.as_bytes());
+    if !mantissa.contains('.') {
+        out.extend_from_slice(b".0");
+    }
+    out.push(b'e');
+    if !exponent.starts_with(['+', '-']) {
+        out.push(b'+');
+    }
+    out.extend_from_slice(exponent.as_bytes());
 }
 
 fn is_empty_container(node: &Node) -> bool {
@@ -413,11 +432,11 @@ pub fn xml_name(key: &str) -> Cow<'_, str> {
     let ok = |c: char| c.is_alphanumeric() || matches!(c, '_' | '-' | '.');
     let mut chars = key.chars();
     match chars.next() {
-        Some(c) if ok_start(c) && chars.all(ok) && !key.to_ascii_lowercase().starts_with("xml") => Cow::Borrowed(key),
+        Some(c) if ok_start(c) && chars.all(ok) => Cow::Borrowed(key),
         _ => {
             let mut out = String::with_capacity(key.len() + 1);
             let body: String = key.chars().map(|c| if ok(c) { c } else { '_' }).collect();
-            if !body.chars().next().is_some_and(ok_start) || body.to_ascii_lowercase().starts_with("xml") {
+            if !body.chars().next().is_some_and(ok_start) {
                 out.push('_');
             }
             out.push_str(&body);
@@ -429,7 +448,20 @@ pub fn xml_name(key: &str) -> Cow<'_, str> {
     }
 }
 
+/// Characters XML 1.0 cannot hold at all, not even as `&#N;`.
+fn xml_forbidden(c: char) -> bool {
+    matches!(c as u32, 0x00..=0x08 | 0x0B | 0x0C | 0x0E..=0x1F | 0xFFFE | 0xFFFF)
+}
+
+/// Escape text for XML. Characters XML cannot represent (control
+/// characters other than tab, LF and CR, U+FFFE, U+FFFF; possible in JSON)
+/// become U+FFFD.
 pub fn xml_escape(out: &mut Vec<u8>, s: &str, attribute: bool) {
+    let has_forbidden = s.bytes().any(|b| b < 0x20 && !matches!(b, b'\t' | b'\n' | b'\r')) || s.contains(['\u{FFFE}', '\u{FFFF}']);
+    if has_forbidden {
+        let cleaned: String = s.chars().map(|c| if xml_forbidden(c) { '\u{FFFD}' } else { c }).collect();
+        return xml_escape(out, &cleaned, attribute);
+    }
     let mut plain = 0;
     let bytes = s.as_bytes();
     for (i, &b) in bytes.iter().enumerate() {
@@ -649,6 +681,11 @@ mod tests {
         let mut out = Vec::new();
         write_yaml_record(&mut out, &rec);
         assert_eq!(String::from_utf8(out).unwrap(), "- id: \"00123\"\n  \"yes\": \"no\"\n  list:\n  - \"a\"\n  - k: 1.5\n  e: []\n");
+        for (json, yaml) in [("1e5", "1.0e+5"), ("-2E-3", "-2.0e-3"), ("1.5e10", "1.5e+10"), ("-0", "-0"), ("1.50", "1.50")] {
+            let mut out = Vec::new();
+            write_yaml_number(&mut out, json);
+            assert_eq!(String::from_utf8(out).unwrap(), yaml);
+        }
     }
 
     #[test]
@@ -658,7 +695,11 @@ mod tests {
         write_xml_element(&mut out, "part", &rec, 0, &XmlStyle { scalars: XmlScalars::Attributes, attr_prefix: "" });
         assert_eq!(String::from_utf8(out).unwrap(), "<part id=\"1\">a&lt;b\n  <name>Bolt</name>\n  <name/>\n</part>");
         assert_eq!(xml_name("1 bad key"), "_1_bad_key");
-        assert_eq!(xml_name("xmlish"), "_xmlish");
+        assert_eq!(xml_name("xmlData"), "xmlData");
+        assert_eq!(xml_name(""), "_");
+        let mut out = Vec::new();
+        xml_escape(&mut out, "a\u{1}b\u{FFFF}", false);
+        assert_eq!(String::from_utf8(out).unwrap(), "a\u{FFFD}b\u{FFFD}");
     }
 
     #[test]

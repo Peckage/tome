@@ -69,8 +69,8 @@ XML and JSON files also get a Records view, which is where converting happens.
 | Pretty JSON | An indented array, exactly like `json.dumps(records, indent=2)` |
 | Compact JSON | An array with one compact record per line |
 | NDJSON | One compact record per line, no array |
-| YAML | A sequence with one item per record. Strings are always double-quoted, so `"00123"`, `"yes"` and `"null"` stay strings in every YAML reader. |
-| XML | `<records>` with one element per record. For XML input, strings become attributes and lists become repeated child elements, so XML → XML round-trips. For JSON input, values become child elements. Keys that aren't valid XML names are fixed (`1 bad` → `_1_bad`). |
+| YAML | A sequence with one item per record. Strings are always double-quoted, so `"00123"`, `"yes"` and `"null"` stay strings in every YAML reader. Numbers with an exponent are written as `1.0e+5` (the same value), because YAML 1.1 readers would read `1e5` as a string. |
+| XML | `<records>` with one element per record. For XML input, strings become attributes and lists become repeated child elements, so XML → XML round-trips. For JSON input, values become child elements. Keys that aren't valid XML names are fixed (`1 bad` → `_1_bad`). Control characters that XML can't hold at all (possible in JSON) become `�`. |
 | CSV / TSV | One row per record. Nested keys become dotted columns (`price.cur`). `#text` adds nothing to the column name, so `name: [{"#text": "Bolt"}]` is the column `name`. A column with several values (a list) holds them joined with `; `. The columns are every key seen in any record, in order of first appearance. |
 
 Converting JSON to JSON is also a fast formatter: pretty-print a one-line 100 MB file, or minify an indented one. Numbers keep their exact text, and key order and duplicate keys are preserved.
